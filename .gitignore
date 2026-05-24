@@ -1,0 +1,44 @@
+# CMake build output
+/build/
+/build_old/
+*.profraw
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CPackConfig.cmake
+CPackSourceConfig.cmake
+Makefile
+compile_commands.json
+
+# Compiled binaries and libraries
+*.dylib
+*.so
+*.a
+*.o
+*.exe
+
+# Executables (no extension, Unix-style)
+litert_server
+
+# Bazel
+/bazel-*
+MODULE.bazel.lock
+
+# Models (large; download separately)
+*.litertlm
+*.task
+/models/
+
+# Third-party fetched dependencies
+library/third_party/
+cmake/
+
+# Logs
+*.log
+
+# Editor / OS
+.DS_Store
+.idea/
+*.swp

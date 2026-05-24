@@ -1,0 +1,21 @@
+{
+  "configurations": [
+    {
+      "name": "Mac",
+      "compileCommands": "${workspaceFolder}/build/compile_commands.json",
+      "includePath": [
+        "${workspaceFolder}",
+        "${workspaceFolder}/server",
+        "${workspaceFolder}/../LiteRT-LM",
+        "${workspaceFolder}/build/_deps/cpp_httplib-src",
+        "${workspaceFolder}/build/_deps/nlohmann_json-src/include"
+      ],
+      "cppStandard": "c++17",
+      "macFrameworkPath": [
+        "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks"
+      ],
+      "intelliSenseMode": "macos-clang-arm64"
+    }
+  ],
+  "version": 4
+}

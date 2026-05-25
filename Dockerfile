@@ -6,7 +6,7 @@ FROM ubuntu:24.04 AS builder
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      git git-lfs clang cmake \
+      git git-lfs clang cmake ninja-build \
       libssl-dev \
       python3 openjdk-17-jdk-headless \
       curl ca-certificates && \
@@ -44,6 +44,7 @@ RUN cmake -B /build \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_C_COMPILER=clang \
       -DCMAKE_CXX_COMPILER=clang++ \
+      -GNinja \
       -Wno-dev \
       -S /src && \
     cmake --build /build -j$(nproc)

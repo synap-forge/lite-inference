@@ -32,7 +32,6 @@ MODULE.bazel.lock
 /models/
 
 # Third-party fetched dependencies
-library/third_party/
 cmake/
 
 # Logs

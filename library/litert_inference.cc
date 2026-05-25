@@ -64,6 +64,50 @@ namespace
     return msgs;
   }
 
+  // Like ToMessages, but also attaches media[i] (an array of media_counts[i]
+  // LiteInferenceMedia) to each message. media / media_counts may be NULL.
+  std::vector<lite_inference::ChatMessage> ToMessagesEx(
+      const char *const *roles,
+      const char *const *contents,
+      const LiteInferenceMedia *const *media,
+      const int *media_counts,
+      int n)
+  {
+    std::vector<lite_inference::ChatMessage> msgs;
+    msgs.reserve(n);
+    for (int i = 0; i < n; ++i)
+    {
+      lite_inference::ChatMessage m;
+      m.role = roles[i] ? roles[i] : "";
+      m.content = contents[i] ? contents[i] : "";
+
+      if (media && media_counts && media[i] && media_counts[i] > 0)
+      {
+        const LiteInferenceMedia *atts = media[i];
+        const int count = media_counts[i];
+        m.media.reserve(count);
+        for (int j = 0; j < count; ++j)
+        {
+          lite_inference::MediaAttachment att;
+          att.type = (atts[j].type == LITE_INFERENCE_MEDIA_AUDIO)
+                         ? lite_inference::MediaType::kAudio
+                         : lite_inference::MediaType::kImage;
+          if (atts[j].path && atts[j].path[0] != '\0')
+          {
+            att.path = atts[j].path;
+          }
+          else if (atts[j].data && atts[j].data_len > 0)
+          {
+            att.data.assign(atts[j].data, atts[j].data + atts[j].data_len);
+          }
+          m.media.push_back(std::move(att));
+        }
+      }
+      msgs.push_back(std::move(m));
+    }
+    return msgs;
+  }
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -84,6 +128,10 @@ LiteInferenceEngine *LiteInferenceEngineCreate(const LiteInferenceOptions *opts)
   eo.force_gpu = opts->force_gpu != 0;
   eo.multimodal = opts->multimodal != 0;
   eo.mtp = opts->mtp != 0;
+  if (opts->cache_dir && opts->cache_dir[0])
+    eo.cache_dir = opts->cache_dir;
+  if (opts->dispatch_lib_dir && opts->dispatch_lib_dir[0])
+    eo.dispatch_lib_dir = opts->dispatch_lib_dir;
 
   // model_id: derive from filename (last path component, no extension)
   std::string model_path = opts->model_path;
@@ -175,6 +223,41 @@ char *LiteInferenceGenerate(
   return out;
 }
 
+char *LiteInferenceGenerateEx(
+    LiteInferenceEngine *engine,
+    const char *const *roles,
+    const char *const *contents,
+    const LiteInferenceMedia *const *media,
+    const int *media_counts,
+    int n_messages,
+    const LiteInferenceGenParams *params)
+{
+  if (!engine || !engine->impl)
+    return nullptr;
+
+  auto msgs = ToMessagesEx(roles, contents, media, media_counts, n_messages);
+  auto gp = ToGenParams(params);
+
+  std::string err;
+  std::string result = engine->impl->Generate(msgs, gp, err);
+
+  if (!err.empty())
+  {
+    engine->last_error = err;
+    return nullptr;
+  }
+  engine->last_error.clear();
+
+  char *out = static_cast<char *>(std::malloc(result.size() + 1));
+  if (!out)
+  {
+    engine->last_error = "LiteInferenceGenerateEx: malloc failed";
+    return nullptr;
+  }
+  std::memcpy(out, result.c_str(), result.size() + 1);
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Inference — streaming
 // ---------------------------------------------------------------------------
@@ -255,6 +338,41 @@ int LiteInferenceGenerateStreamPort(
     if (!delta.empty())
       PostString(send_port, delta);
     return true; // never cancel from here
+  };
+
+  std::string err;
+  bool ok = engine->impl->GenerateStream(msgs, gp, on_token, err);
+
+  if (!err.empty())
+    engine->last_error = err;
+  else
+    engine->last_error.clear();
+
+  return ok ? 1 : 0;
+}
+
+int LiteInferenceGenerateStreamPortEx(
+    LiteInferenceEngine *engine,
+    const char *const *roles,
+    const char *const *contents,
+    const LiteInferenceMedia *const *media,
+    const int *media_counts,
+    int n_messages,
+    const LiteInferenceGenParams *params,
+    int64_t send_port)
+{
+  if (!engine || !engine->impl)
+    return 0;
+
+  auto msgs = ToMessagesEx(roles, contents, media, media_counts, n_messages);
+  auto gp = ToGenParams(params);
+
+  lite_inference::TokenCallback on_token =
+      [send_port](const std::string &delta) -> bool
+  {
+    if (!delta.empty())
+      PostString(send_port, delta);
+    return true;
   };
 
   std::string err;

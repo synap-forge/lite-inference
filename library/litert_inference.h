@@ -40,6 +40,8 @@ typedef struct {
   int         force_gpu;        // 1 = abort if GPU unavailable, 0 = allow CPU fallback
   int         multimodal;       // 1 = enable vision + audio backends
   int         mtp;              // 1 = enable multi-token prediction / speculative decoding
+  const char* cache_dir;        // Directory for GPU shader/weight cache (NULL = model dir)
+  const char* dispatch_lib_dir; // Directory containing LiteRT accelerator plugins (NULL = skip)
 } LiteInferenceOptions;
 
 // ---------------------------------------------------------------------------
@@ -59,6 +61,26 @@ typedef struct {
 #define LITE_INFERENCE_ROLE_SYSTEM    "system"
 #define LITE_INFERENCE_ROLE_USER      "user"
 #define LITE_INFERENCE_ROLE_ASSISTANT "assistant"
+
+// ---------------------------------------------------------------------------
+// Media attachments (multimodal input)
+//
+// Each message may carry zero or more media attachments (images / audio).
+// Provide either a file `path` OR inline `data` bytes (not both); the engine
+// prefers `path` when set. `data` is copied during the call — the caller may
+// free it immediately afterwards.
+// ---------------------------------------------------------------------------
+typedef enum {
+  LITE_INFERENCE_MEDIA_IMAGE = 0,
+  LITE_INFERENCE_MEDIA_AUDIO = 1,
+} LiteInferenceMediaType;
+
+typedef struct {
+  int                  type;       // LiteInferenceMediaType
+  const char*          path;       // absolute file path, or NULL/"" if using data
+  const unsigned char* data;       // inline bytes, or NULL if using path
+  int                  data_len;   // length of `data` in bytes (0 if using path)
+} LiteInferenceMedia;
 
 // ---------------------------------------------------------------------------
 // Streaming callback
@@ -128,6 +150,23 @@ int LiteInferenceGenerateStream(
     void*                         user_data);
 
 // ---------------------------------------------------------------------------
+// Inference — blocking, with multimodal attachments
+//
+// Like LiteInferenceGenerate, but each message i may carry `media_counts[i]`
+// attachments starting at `media[i]` (a pointer to an array of
+// LiteInferenceMedia). Pass media=NULL / media_counts=NULL for text-only.
+// ---------------------------------------------------------------------------
+LITE_INFERENCE_EXPORT
+char* LiteInferenceGenerateEx(
+    LiteInferenceEngine*              engine,
+    const char* const*               roles,
+    const char* const*               contents,
+    const LiteInferenceMedia* const*  media,        // media[i] = array for msg i (or NULL)
+    const int*                        media_counts, // media_counts[i] = #attachments (or NULL)
+    int                               n_messages,
+    const LiteInferenceGenParams*     params);
+
+// ---------------------------------------------------------------------------
 // Dart DL API initialisation
 //
 // Must be called once (per process) with NativeApi.initializeApiDLData before
@@ -157,6 +196,24 @@ int LiteInferenceGenerateStreamPort(
     int                           n_messages,
     const LiteInferenceGenParams* params,
     int64_t                       send_port);
+
+// ---------------------------------------------------------------------------
+// Inference — streaming (Dart native port), with multimodal attachments
+//
+// Like LiteInferenceGenerateStreamPort, but each message i may carry
+// `media_counts[i]` attachments starting at `media[i]`. Pass media=NULL /
+// media_counts=NULL for text-only.
+// ---------------------------------------------------------------------------
+LITE_INFERENCE_EXPORT
+int LiteInferenceGenerateStreamPortEx(
+    LiteInferenceEngine*              engine,
+    const char* const*               roles,
+    const char* const*               contents,
+    const LiteInferenceMedia* const*  media,
+    const int*                        media_counts,
+    int                               n_messages,
+    const LiteInferenceGenParams*     params,
+    int64_t                           send_port);
 
 // ---------------------------------------------------------------------------
 // Error handling

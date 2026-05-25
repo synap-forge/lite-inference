@@ -289,3 +289,12 @@ python3 benchmark.py --url http://localhost:8080 --prompt "Explain gravity in on
 python3 benchmark.py --api-key mykey -c 4 -n 10
 
 ```
+
+
+otool -L /Volumes/Sources/Developments/appsrc/lite-inference/build/libLiteRtTopKMetalSampler.dylib | head -5
+
+
+python3 benchmark.py \ 
+  --image /Volumes/Sources/Documents/Projects/receipts/costco.jpg \
+  --prompt "What is in this image?" \
+  -n 10 -c 10 2>&1

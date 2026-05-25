@@ -123,23 +123,30 @@ std::unique_ptr<LlmEngine> LlmEngine::Create(const std::string& model_path,
       litert_lm_engine_settings_set_max_num_images(settings, 1);
     if (opts.mtp)
       litert_lm_engine_settings_set_enable_speculative_decoding(settings, true);
+    if (!opts.cache_dir.empty())
+      litert_lm_engine_settings_set_cache_dir(settings, opts.cache_dir.c_str());
+    if (!opts.dispatch_lib_dir.empty())
+      litert_lm_engine_settings_set_litert_dispatch_lib_dir(
+          settings, opts.dispatch_lib_dir.c_str());
     LiteRtLmEngine* eng = litert_lm_engine_create(settings);
     litert_lm_engine_settings_delete(settings);
     return eng;
   };
 
   if (want_gpu) {
-    fprintf(stderr, "Initializing GPU (Metal) engine%s%s...\n",
+    fprintf(stderr, "[lite_inference] Initializing GPU (Metal) engine%s%s...\n",
             opts.multimodal ? " +multimodal" : "",
             opts.mtp        ? " +mtp"        : "");
     self->impl_->engine = try_create("gpu");
     if (self->impl_->engine) {
+      fprintf(stderr, "[lite_inference] GPU engine created successfully.\n");
       self->active_backend_ = "gpu";
     } else if (opts.force_gpu) {
-      error_out = "GPU engine init failed and --force_gpu is set; refusing CPU fallback";
+      error_out = "GPU (Metal) engine init failed; no CPU fallback (force_gpu=true). "
+                  "Check stderr/device console for ABSL error details.";
       return nullptr;
     } else {
-      fprintf(stderr, "GPU init failed, falling back to CPU.\n");
+      fprintf(stderr, "[lite_inference] GPU init failed, falling back to CPU.\n");
     }
   }
 

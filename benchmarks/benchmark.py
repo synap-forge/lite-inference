@@ -2,13 +2,43 @@
 """Benchmark the lite-inference OpenAI-compatible server."""
 
 import argparse
+import base64
 import json
+import mimetypes
+import os
 import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import urllib.request
 import urllib.error
+
+
+def build_image_url(image):
+    """Turn an --image value into an OpenAI image_url 'url' string.
+
+    A local file path is read and base64-encoded into a data URL so the
+    server doesn't need filesystem access. http(s)://, file://, and existing
+    data: URLs are passed through unchanged.
+    """
+    if image.startswith(("http://", "https://", "file://", "data:")):
+        return image
+    if not os.path.isfile(image):
+        raise FileNotFoundError(f"image not found: {image}")
+    mime = mimetypes.guess_type(image)[0] or "image/jpeg"
+    with open(image, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    return f"data:{mime};base64,{b64}"
+
+
+def build_content(prompt, image_urls):
+    """Return the OpenAI message content: a plain string, or a multimodal array."""
+    if not image_urls:
+        return prompt
+    content = [{"type": "text", "text": prompt}]
+    for url in image_urls:
+        content.append({"type": "image_url", "image_url": {"url": url}})
+    return content
 
 
 def resolve_model(base_url, model):
@@ -23,11 +53,11 @@ def resolve_model(base_url, model):
         return "default"
 
 
-def chat_completion(base_url, prompt, stream, model="auto", api_key=None, timeout=120):
+def chat_completion(base_url, content, stream, model="auto", api_key=None, timeout=120):
     url = f"{base_url}/v1/chat/completions"
     payload = json.dumps({
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [{"role": "user", "content": content}],
         "max_tokens": 256,
         "stream": stream,
     }).encode()
@@ -89,14 +119,19 @@ def chat_completion(base_url, prompt, stream, model="auto", api_key=None, timeou
     }
 
 
-def run_benchmark(base_url, prompt, concurrency, total_requests, stream, api_key, model="auto"):
+def run_benchmark(base_url, prompt, concurrency, total_requests, stream, api_key,
+                  model="auto", images=None):
     model = resolve_model(base_url, model)
+    image_urls = [build_image_url(i) for i in (images or [])]
+    content = build_content(prompt, image_urls)
     print(f"\nTarget:       {base_url}")
     print(f"Model:        {model}")
     print(f"Concurrency:  {concurrency}")
     print(f"Requests:     {total_requests}")
     print(f"Stream:       {stream}")
     print(f"Prompt:       {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
+    if images:
+        print(f"Images:       {len(images)} ({', '.join(os.path.basename(i) for i in images)})")
     print("-" * 60)
 
     results = []
@@ -104,7 +139,7 @@ def run_benchmark(base_url, prompt, concurrency, total_requests, stream, api_key
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = [
-            pool.submit(chat_completion, base_url, prompt, stream, model, api_key)
+            pool.submit(chat_completion, base_url, content, stream, model, api_key)
             for _ in range(total_requests)
         ]
         for i, fut in enumerate(as_completed(futures), 1):
@@ -163,6 +198,9 @@ def main():
     parser.add_argument("--stream", action="store_true", help="Use SSE streaming")
     parser.add_argument("--api-key", default=None, help="Bearer API key if required")
     parser.add_argument("--model", default="auto", help="Model id (default: auto-detect from /v1/models)")
+    parser.add_argument("--image", action="append", default=None,
+                        help="Image to attach (local path, http(s)/file/data URL). "
+                             "Repeat for multiple images. Requires a multimodal model.")
     args = parser.parse_args()
 
     run_benchmark(
@@ -173,6 +211,7 @@ def main():
         stream=args.stream,
         api_key=args.api_key,
         model=args.model,
+        images=args.image,
     )
 
 

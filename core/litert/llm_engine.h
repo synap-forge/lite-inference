@@ -9,10 +9,12 @@
 namespace lite_inference {
 
 struct EngineOptions {
-  std::string backend = "gpu"; // "gpu" | "cpu"
-  bool multimodal     = false; // enable vision + audio sub-backends (cpu)
-  bool mtp            = false; // enable speculative decoding (multi-token prediction)
-  bool force_gpu      = false; // hard-fail if GPU init fails; no CPU fallback
+  std::string backend      = "gpu"; // "gpu" | "cpu"
+  bool multimodal          = false; // enable vision + audio sub-backends (cpu)
+  bool mtp                 = false; // enable speculative decoding (multi-token prediction)
+  bool force_gpu           = false; // hard-fail if GPU init fails; no CPU fallback
+  std::string cache_dir;            // GPU shader/weight cache dir (empty = model dir)
+  std::string dispatch_lib_dir;     // directory containing LiteRT accelerator plugins
 };
 
 // LiteRT-LM backend. Model is loaded once at Create() time.

@@ -1,13 +1,16 @@
 # ---------------------------------------------------------------------------
-# Stage 1: Build — Oracle Linux 9 + Bazel + CMake
+# Stage 1: Build — Ubuntu 24.04 (clang-18, full C++20 support)
 # ---------------------------------------------------------------------------
-FROM oraclelinux:9 AS builder
+FROM ubuntu:24.04 AS builder
 
-RUN dnf install -y \
-      git git-lfs clang cmake openssl-devel \
-      python3 java-17-openjdk-devel \
-      curl unzip && \
-    dnf clean all
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git git-lfs clang cmake \
+      libssl-dev \
+      python3 openjdk-17-jdk-headless \
+      curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
 # Install bazelisk
 RUN curl -fsSL \
@@ -18,13 +21,15 @@ RUN curl -fsSL \
 WORKDIR /src
 COPY . .
 
-# Initialise git so Bazel workspace resolution works inside Docker
 RUN git config --global --add safe.directory /src && \
     git lfs install --skip-repo
 
 ENV CC=clang \
     CXX=clang++ \
-    JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+    JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+
+# Prepare Bazel package (copies sources + writes BUILD + patches WORKSPACE)
+RUN SKIP_BAZEL_BUILD=1 bash setup.sh
 
 # Build the shared engine lib via Bazel
 RUN cd LiteRT-LM && bazelisk build //lite_inference_server:libLiteRtLmEngine.so
@@ -39,20 +44,23 @@ RUN cmake -B /build \
     cmake --build /build -j$(nproc)
 
 # ---------------------------------------------------------------------------
-# Stage 2: Runtime — minimal Oracle Linux 9
+# Stage 2: Runtime — minimal Ubuntu 24.04
 # ---------------------------------------------------------------------------
-FROM oraclelinux:9-minimal AS runtime
+FROM ubuntu:24.04 AS runtime
 
-RUN microdnf install -y openssl libstdc++ && \
-    microdnf clean all
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libssl3 libstdc++6 ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY --from=builder /build/litert_server          ./litert_server
-COPY --from=builder /build/libLiteRtLmEngine.so   ./libLiteRtLmEngine.so
+COPY --from=builder /build/litert_server         ./litert_server
+COPY --from=builder /build/libLiteRtLmEngine.so  ./libLiteRtLmEngine.so
 
-# libLiteRtLmEngine.so lives next to the binary; LD_LIBRARY_PATH is not needed
-# because CMake sets INSTALL_RPATH="$ORIGIN".
+# libLiteRtLmEngine.so is next to the binary; CMake sets RPATH=$ORIGIN
+# so no LD_LIBRARY_PATH needed.
 ENV HF_HOME=/data/huggingface
 
 EXPOSE 8080

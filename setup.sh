@@ -157,9 +157,13 @@ fi
 # ---------------------------------------------------------------------------
 # 4. Build libLiteRtLmEngine.so
 # ---------------------------------------------------------------------------
-echo "→ Building libLiteRtLmEngine.so (this takes a few minutes the first time) ..."
-cd "${LITERT_DIR}"
-bazelisk build //lite_inference_server:libLiteRtLmEngine.so
+if [[ "${SKIP_BAZEL_BUILD:-0}" == "1" ]]; then
+  echo "→ Skipping Bazel build (SKIP_BAZEL_BUILD=1)."
+else
+  echo "→ Building libLiteRtLmEngine.so (this takes a few minutes the first time) ..."
+  cd "${LITERT_DIR}"
+  bazelisk build //lite_inference_server:libLiteRtLmEngine.so
+fi
 
 echo ""
 echo "✓ Setup complete."

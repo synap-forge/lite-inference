@@ -35,6 +35,11 @@ jobs:
             -o /usr/local/bin/bazelisk
           chmod +x /usr/local/bin/bazelisk
 
+      - name: Prepare Bazel package (setup.sh without build)
+        env:
+          SKIP_BAZEL_BUILD: 1
+        run: bash setup.sh
+
       - name: Build libLiteRtLmEngine.so (Bazel)
         working-directory: LiteRT-LM
         env:
@@ -87,6 +92,11 @@ jobs:
           curl -fsSL https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64 \
             -o /usr/local/bin/bazelisk
           chmod +x /usr/local/bin/bazelisk
+
+      - name: Prepare Bazel package (setup.sh without build)
+        env:
+          SKIP_BAZEL_BUILD: 1
+        run: bash setup.sh
 
       - name: Build libLiteRtLmEngine.so (Bazel)
         working-directory: LiteRT-LM
@@ -163,6 +173,12 @@ jobs:
 
       - name: Install OpenSSL via choco
         run: choco install openssl -y --no-progress
+
+      - name: Prepare Bazel package (setup.sh without build)
+        shell: bash
+        env:
+          SKIP_BAZEL_BUILD: "1"
+        run: bash setup.sh
 
       - name: Build libLiteRtLmEngine.dll (Bazel)
         working-directory: LiteRT-LM

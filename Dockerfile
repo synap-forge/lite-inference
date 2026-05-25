@@ -12,9 +12,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Install bazelisk
-RUN curl -fsSL \
-      https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64 \
+# Install bazelisk (pick binary matching the build platform)
+RUN ARCH=$(uname -m) && \
+    case "$ARCH" in \
+      aarch64) BAZEL_ARCH=arm64 ;; \
+      *)        BAZEL_ARCH=amd64 ;; \
+    esac && \
+    curl -fsSL \
+      "https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-${BAZEL_ARCH}" \
       -o /usr/local/bin/bazelisk && \
     chmod +x /usr/local/bin/bazelisk
 

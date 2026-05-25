@@ -1,0 +1,187 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "v*"
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Oracle Linux 9 — CPU
+  # ---------------------------------------------------------------------------
+  oracle-linux-cpu:
+    name: Oracle Linux 9 / CPU
+    runs-on: ubuntu-latest
+    container:
+      image: oraclelinux:9
+
+    steps:
+      - name: Install system deps
+        run: |
+          dnf install -y git git-lfs clang cmake openssl-devel python3 java-17-openjdk-devel curl unzip
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: true
+
+      - name: Install bazelisk
+        run: |
+          curl -fsSL https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64 \
+            -o /usr/local/bin/bazelisk
+          chmod +x /usr/local/bin/bazelisk
+
+      - name: Build libLiteRtLmEngine.so (Bazel)
+        working-directory: LiteRT-LM
+        env:
+          CC: clang
+          CXX: clang++
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+        run: bazelisk build //lite_inference_server:libLiteRtLmEngine.so
+
+      - name: Configure CMake
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -Wno-dev
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: litert-server-oracle-linux-cpu
+          path: |
+            build/litert_server
+            build/libLiteRtLmEngine.so
+
+  # ---------------------------------------------------------------------------
+  # Ubuntu 22.04 — CPU
+  # ---------------------------------------------------------------------------
+  ubuntu-cpu:
+    name: Ubuntu 22.04 / CPU
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git git-lfs clang cmake libssl-dev python3 \
+            default-jdk curl unzip
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: true
+
+      - name: Install bazelisk
+        run: |
+          curl -fsSL https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64 \
+            -o /usr/local/bin/bazelisk
+          chmod +x /usr/local/bin/bazelisk
+
+      - name: Build libLiteRtLmEngine.so (Bazel)
+        working-directory: LiteRT-LM
+        env:
+          CC: clang
+          CXX: clang++
+        run: bazelisk build //lite_inference_server:libLiteRtLmEngine.so
+
+      - name: Configure CMake
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -Wno-dev
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: litert-server-ubuntu-cpu
+          path: |
+            build/litert_server
+            build/libLiteRtLmEngine.so
+
+  # ---------------------------------------------------------------------------
+  # Windows — CPU
+  # ---------------------------------------------------------------------------
+  windows-cpu:
+    name: Windows / CPU
+    runs-on: windows-2022
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: true
+
+      - name: Enable long paths
+        run: |
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' `
+            -Name LongPathsEnabled -Value 1
+
+      - name: Install Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install bazelisk
+        run: |
+          $url = "https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-windows-amd64.exe"
+          Invoke-WebRequest $url -OutFile "$Env:RUNNER_TEMP\bazelisk.exe"
+          echo "$Env:RUNNER_TEMP" | Out-File -FilePath $Env:GITHUB_PATH -Encoding utf8 -Append
+          # Alias so scripts can call 'bazelisk'
+          Copy-Item "$Env:RUNNER_TEMP\bazelisk.exe" "$Env:RUNNER_TEMP\bazel.exe"
+
+      - name: Set up MSVC (Visual Studio 2022)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install OpenSSL via choco
+        run: choco install openssl -y --no-progress
+
+      - name: Build libLiteRtLmEngine.dll (Bazel)
+        working-directory: LiteRT-LM
+        run: bazelisk build //lite_inference_server:libLiteRtLmEngine.so --config=windows
+
+      - name: Configure CMake
+        run: |
+          cmake -B build `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DOPENSSL_ROOT_DIR="C:\Program Files\OpenSSL-Win64" `
+            -Wno-dev
+
+      - name: Build
+        run: cmake --build build --config Release -j $Env:NUMBER_OF_PROCESSORS
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: litert-server-windows-cpu
+          path: |
+            build/Release/litert_server.exe
+            build/Release/LiteRtLmEngine.dll

@@ -22,7 +22,12 @@ WORKDIR /src
 COPY . .
 
 RUN git config --global --add safe.directory /src && \
-    git lfs install --skip-repo
+    git lfs install --skip-repo && \
+    # If COPY brought in an uninitialised submodule (local build outside CI),
+    # initialise it now. In CI the submodule is already populated by checkout.
+    if [ ! -f LiteRT-LM/WORKSPACE ]; then \
+      git submodule update --init --recursive; \
+    fi
 
 ENV CC=clang \
     CXX=clang++ \

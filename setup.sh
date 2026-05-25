@@ -130,7 +130,11 @@ if ! grep -q '"cpp_httplib"' "${WORKSPACE}"; then
   # Fetch the real sha256 so the build is hermetic.
   HTTPLIB_URL="https://github.com/yhirose/cpp-httplib/archive/refs/tags/v0.18.3.tar.gz"
   echo "  Fetching sha256 for cpp-httplib v0.18.3 ..."
-  HTTPLIB_SHA=$(curl -sL "${HTTPLIB_URL}" | shasum -a 256 | awk '{print $1}')
+  if command -v sha256sum &>/dev/null; then
+    HTTPLIB_SHA=$(curl -sL "${HTTPLIB_URL}" | sha256sum | awk '{print $1}')
+  else
+    HTTPLIB_SHA=$(curl -sL "${HTTPLIB_URL}" | shasum -a 256 | awk '{print $1}')
+  fi
   echo "  sha256 = ${HTTPLIB_SHA}"
 
   cat >> "${WORKSPACE}" <<WORKSPACE_EOF

@@ -110,14 +110,14 @@ jobs:
             podman volume create litert-hf-cache 2>/dev/null || true
 
             # ---- replace container ------------------------------------------
-            podman stop  litert-server 2>/dev/null || true
-            podman rm    litert-server 2>/dev/null || true
+            # Host port 8080 is taken by oscar-emr; publish litert on 8090.
+            podman rm -f litert-server 2>/dev/null || true
 
             echo "Starting litert-server ..."
             podman run -d \
               --name litert-server \
               --pull never \
-              -p 8080:8080 \
+              -p 8090:8080 \
               -v litert-hf-cache:/data/huggingface:z \
               -e HF_TOKEN=${{ secrets.HF_TOKEN }} \
               -e HF_HOME=/data/huggingface \
@@ -135,4 +135,4 @@ jobs:
             echo ""
             echo "=== Health check ==="
             sleep 3
-            curl -sf http://localhost:8080/health && echo " OK" || echo " (not ready yet — model may still be loading)"
+            curl -sf http://localhost:8090/health && echo " OK" || echo " (not ready yet — model may still be loading)"

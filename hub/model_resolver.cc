@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <vector>
 
 namespace lite_inference {
 namespace fs = std::filesystem;

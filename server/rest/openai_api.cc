@@ -19,6 +19,10 @@
 #include "httplib.h"
 #include "nlohmann/json.hpp"
 #include "core/engine.h"
+#include "core/engine_manager.h"
+#include "hub/model_resolver.h"
+#include "server/rest/openapi.h"
+#include "server/rest/reflect.h"
 
 namespace {
 
@@ -234,7 +238,7 @@ struct InferenceQueue {
 
 static InferenceQueue g_queue;
 
-void HandleChatCompletions(EngineBase& engine, const ServerOptions& opts,
+void HandleChatCompletions(EngineManager& manager, const ServerOptions& opts,
                            const httplib::Request& req,
                            httplib::Response& res) {
   if (!Authorized(req, opts)) {
@@ -249,13 +253,23 @@ void HandleChatCompletions(EngineBase& engine, const ServerOptions& opts,
     return;
   }
 
+  // Pin the active engine for the entire request. While this guard is held,
+  // POST /v1/models/load will block (it takes the unique lock).
+  auto guard = std::make_shared<EngineManager::Guard>(manager.Acquire());
+  if (!*guard) {
+    JsonError(res, 503, "No model loaded", "server_error");
+    return;
+  }
+  EngineBase& engine = guard->engine();
+
   if (body.contains("model") && body["model"].is_string()) {
     const std::string requested = body["model"].get<std::string>();
     if (requested != engine.model_id()) {
       JsonError(res, 400,
                 "Model '" + requested + "' is not loaded. "
                 "This server is running '" + engine.model_id() + "'. "
-                "Start the server with --hf_repo " + requested,
+                "Call POST /v1/models/load to switch, or start with --hf_repo " +
+                    requested,
                 "invalid_request_error");
       return;
     }
@@ -281,8 +295,9 @@ void HandleChatCompletions(EngineBase& engine, const ServerOptions& opts,
     res.set_header("Cache-Control", "no-cache");
     res.set_chunked_content_provider(
         "text/event-stream",
-        [&engine, messages = pr.messages, params = pr.params,
+        [guard, messages = pr.messages, params = pr.params,
          id, created, model, slot](size_t, httplib::DataSink& sink) -> bool {
+          EngineBase& engine = guard->engine();
           json head = {{"id", id}, {"object", "chat.completion.chunk"},
                        {"created", created}, {"model", model},
                        {"choices", {{{"index", 0},
@@ -340,47 +355,378 @@ void HandleChatCompletions(EngineBase& engine, const ServerOptions& opts,
   res.set_content(out.dump(), "application/json");
 }
 
-void HandleModels(EngineBase& engine, httplib::Response& res) {
-  json out = {{"object", "list"},
-              {"data", {{{"id", engine.model_id()}, {"object", "model"},
-                         {"created", NowSeconds()}, {"owned_by", "litert-lm"}}}}};
+void HandleModels(EngineManager& manager, httplib::Response& res) {
+  auto guard = manager.Acquire();
+  const std::string active = guard ? guard.engine().model_id() : "";
+
+  json data = json::array();
+  // Currently loaded engine first.
+  if (!active.empty()) {
+    data.push_back({{"id", active}, {"object", "model"},
+                    {"created", NowSeconds()}, {"owned_by", "litert-lm"},
+                    {"status", "loaded"}});
+  }
+  // Anything else sitting in the HF cache, available for /load.
+  for (const auto& c : ListCachedModels()) {
+    if (c.repo_id == active) continue;
+    data.push_back({{"id", c.repo_id}, {"object", "model"},
+                    {"created", NowSeconds()}, {"owned_by", "litert-lm"},
+                    {"status", "cached"},
+                    {"revision", c.revision},
+                    {"filename", c.filename}});
+  }
+  res.set_content(json{{"object", "list"}, {"data", data}}.dump(),
+                  "application/json");
+}
+
+// Parse the load/pull request body into a LoadRequest. Both endpoints share
+// the same shape; pull ignores backend/mtp/multimodal but accepts them
+// silently for client convenience.
+bool ParseLoadRequest(const json& body, ServerOptions::LoadRequest& out,
+                      std::string& err) {
+  if (!body.contains("repo_id") || !body["repo_id"].is_string()) {
+    err = "'repo_id' is required (string)";
+    return false;
+  }
+  out.repo_id  = body["repo_id"].get<std::string>();
+  out.filename = body.value("filename", "");
+  out.revision = body.value("revision", "");
+  out.backend  = body.value("backend", "");
+  if (body.contains("multimodal") && body["multimodal"].is_boolean()) {
+    out.has_multimodal = true;
+    out.multimodal     = body["multimodal"].get<bool>();
+  }
+  if (body.contains("mtp") && body["mtp"].is_boolean()) {
+    out.has_mtp = true;
+    out.mtp     = body["mtp"].get<bool>();
+  }
+  return true;
+}
+
+void HandlePull(const httplib::Request& req, httplib::Response& res) {
+  json body;
+  try { body = json::parse(req.body); }
+  catch (const std::exception& e) {
+    JsonError(res, 400, std::string("Invalid JSON: ") + e.what(),
+              "invalid_request_error");
+    return;
+  }
+  ServerOptions::LoadRequest lr;
+  std::string err;
+  if (!ParseLoadRequest(body, lr, err)) {
+    JsonError(res, 400, err, "invalid_request_error");
+    return;
+  }
+  ResolveOptions ro;
+  ro.repo_id  = lr.repo_id;
+  ro.filename = lr.filename;
+  if (!lr.revision.empty()) ro.revision = lr.revision;
+
+  std::string resolve_err;
+  std::string path = ResolveModel(ro, resolve_err);
+  if (path.empty()) {
+    JsonError(res, 500, "Pull failed: " + resolve_err, "server_error");
+    return;
+  }
+  json out = {{"repo_id", lr.repo_id}, {"path", path}, {"status", "ready"}};
   res.set_content(out.dump(), "application/json");
 }
 
+void HandleLoad(EngineManager& manager, const ServerOptions& opts,
+                const httplib::Request& req, httplib::Response& res) {
+  if (!opts.build_engine) {
+    JsonError(res, 500, "Server has no engine factory configured",
+              "server_error");
+    return;
+  }
+  json body;
+  try { body = json::parse(req.body); }
+  catch (const std::exception& e) {
+    JsonError(res, 400, std::string("Invalid JSON: ") + e.what(),
+              "invalid_request_error");
+    return;
+  }
+  ServerOptions::LoadRequest lr;
+  std::string err;
+  if (!ParseLoadRequest(body, lr, err)) {
+    JsonError(res, 400, err, "invalid_request_error");
+    return;
+  }
+
+  // Drain in-flight inference before flipping engines. The shared_mutex in
+  // EngineManager would already serialize the swap, but draining here keeps
+  // the queue's invariant simple: no Generate() calls run while an engine
+  // pointer is being replaced underneath them.
+  {
+    std::unique_lock<std::mutex> lk(g_queue.mtx);
+    g_queue.cv.wait(lk, [] { return g_queue.active == 0; });
+  }
+
+  std::string build_err;
+  bool ok = manager.Swap(
+      [&](std::string& e) { return opts.build_engine(lr, e); }, build_err);
+  if (!ok) {
+    JsonError(res, 500, "Load failed: " + build_err, "server_error");
+    return;
+  }
+
+  auto guard = manager.Acquire();
+  json out = {{"status", "ok"},
+              {"model", guard ? guard.engine().model_id() : lr.repo_id},
+              {"backend", guard ? guard.engine().active_backend() : ""}};
+  res.set_content(out.dump(), "application/json");
+}
+
+// ---------------------------------------------------------------------------
+// DTOs used solely for OpenAPI schema generation. Handlers continue to parse
+// nlohmann::json directly — these structs exist so Body<T>()/Response<T>()
+// can derive a JSON Schema via reflection.
+// ---------------------------------------------------------------------------
+
+struct ChatMessageDto {
+  std::string                role;
+  std::string                content;  // string or content-part array; described as string here
+  LITERT_REFLECT(ChatMessageDto, role, content)
+};
+
+struct ChatCompletionRequestDto {
+  std::string                                  model;
+  std::vector<ChatMessageDto>                  messages;
+  std::optional<float>                         temperature;
+  std::optional<float>                         top_p;
+  std::optional<int>                           top_k;
+  std::optional<int>                           max_tokens;
+  std::optional<int>                           visual_token_budget;
+  std::optional<bool>                          stream;
+  LITERT_REFLECT(ChatCompletionRequestDto,
+                 model, messages, temperature, top_p, top_k,
+                 max_tokens, visual_token_budget, stream)
+};
+
+struct ChatChoiceDto {
+  int                  index = 0;
+  ChatMessageDto       message;
+  std::string          finish_reason;
+  LITERT_REFLECT(ChatChoiceDto, index, message, finish_reason)
+};
+
+struct UsageDto {
+  int prompt_tokens = 0;
+  int completion_tokens = 0;
+  int total_tokens = 0;
+  LITERT_REFLECT(UsageDto, prompt_tokens, completion_tokens, total_tokens)
+};
+
+struct ChatCompletionResponseDto {
+  std::string                  id;
+  std::string                  object;
+  int                          created = 0;
+  std::string                  model;
+  std::vector<ChatChoiceDto>   choices;
+  UsageDto                     usage;
+  LITERT_REFLECT(ChatCompletionResponseDto,
+                 id, object, created, model, choices, usage)
+};
+
+struct ModelEntryDto {
+  std::string id;
+  std::string object;
+  int         created = 0;
+  std::string owned_by;
+  std::string status;
+  std::optional<std::string> revision;
+  std::optional<std::string> filename;
+  LITERT_REFLECT(ModelEntryDto, id, object, created, owned_by, status, revision, filename)
+};
+
+struct ModelsListResponseDto {
+  std::string                 object;
+  std::vector<ModelEntryDto>  data;
+  LITERT_REFLECT(ModelsListResponseDto, object, data)
+};
+
+struct LoadRequestDto {
+  std::string                 repo_id;
+  std::optional<std::string>  filename;
+  std::optional<std::string>  revision;
+  std::optional<std::string>  backend;
+  std::optional<bool>         multimodal;
+  std::optional<bool>         mtp;
+  LITERT_REFLECT(LoadRequestDto, repo_id, filename, revision, backend, multimodal, mtp)
+};
+
+struct PullResponseDto {
+  std::string repo_id;
+  std::string path;
+  std::string status;
+  LITERT_REFLECT(PullResponseDto, repo_id, path, status)
+};
+
+struct LoadResponseDto {
+  std::string status;
+  std::string model;
+  std::string backend;
+  LITERT_REFLECT(LoadResponseDto, status, model, backend)
+};
+
+struct QueueDto {
+  int active = 0;
+  int waiting = 0;
+  int capacity = 0;
+  LITERT_REFLECT(QueueDto, active, waiting, capacity)
+};
+
+struct EngineInfoDto {
+  std::optional<std::string> model;
+  std::optional<std::string> backend;
+  LITERT_REFLECT(EngineInfoDto, model, backend)
+};
+
+struct HealthResponseDto {
+  std::string    status;
+  std::string    version;
+  EngineInfoDto  engine;
+  QueueDto       queue;
+  LITERT_REFLECT(HealthResponseDto, status, version, engine, queue)
+};
+
+struct ErrorObjectDto {
+  std::string                 message;
+  std::string                 type;
+  std::optional<std::string>  code;
+  LITERT_REFLECT(ErrorObjectDto, message, type, code)
+};
+
+struct ErrorResponseDto {
+  ErrorObjectDto error;
+  LITERT_REFLECT(ErrorResponseDto, error)
+};
+
 }  // namespace
 
-int RunServer(EngineBase& engine, const ServerOptions& options) {
+int RunServer(EngineManager& manager, const ServerOptions& options) {
   httplib::Server svr;
+  namespace oa = lite_inference::openapi;
 
-  svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
-    std::lock_guard<std::mutex> lk(g_queue.mtx);
-    json out = {{"status", "ok"},
-                {"version", LITERT_VERSION},
-                {"queue", {{"active",  g_queue.active},
-                           {"waiting", g_queue.waiting},
-                           {"capacity", InferenceQueue::kMaxQueue}}}};
-    res.set_content(out.dump(), "application/json");
-  });
+  oa::Route(svr, "GET", "/health")
+      .Summary("Server and engine health, queue depth, version.")
+      .Tag("system")
+      .Response<HealthResponseDto>(200)
+      .Handler([&manager](const httplib::Request&, httplib::Response& res) {
+        auto guard = manager.Acquire();
+        json engine_info = json::object();
+        if (guard) {
+          engine_info["model"]   = guard.engine().model_id();
+          engine_info["backend"] = guard.engine().active_backend();
+        }
+        std::lock_guard<std::mutex> lk(g_queue.mtx);
+        json out = {{"status", "ok"},
+                    {"version", LITERT_VERSION},
+                    {"engine", engine_info},
+                    {"queue", {{"active",  g_queue.active},
+                               {"waiting", g_queue.waiting},
+                               {"capacity", InferenceQueue::kMaxQueue}}}};
+        res.set_content(out.dump(), "application/json");
+      });
 
-  svr.Get("/v1/models",
-          [&engine](const httplib::Request&, httplib::Response& res) {
-            HandleModels(engine, res);
+  oa::Route(svr, "GET", "/v1/models")
+      .Summary("List the active model plus anything cached locally.")
+      .Tag("models")
+      .Response<ModelsListResponseDto>(200)
+      .Handler([&manager](const httplib::Request&, httplib::Response& res) {
+        HandleModels(manager, res);
+      });
+
+  oa::Route(svr, "POST", "/v1/models/pull")
+      .Summary("Resolve and download a model into the local cache.")
+      .Tag("models")
+      .Body<LoadRequestDto>()
+      .Response<PullResponseDto>(200)
+      .Response<ErrorResponseDto>(400, "Invalid request")
+      .Response<ErrorResponseDto>(401, "Invalid API key")
+      .Response<ErrorResponseDto>(500, "Resolve failed")
+      .Handler([&options](const httplib::Request& req, httplib::Response& res) {
+        if (!Authorized(req, options)) {
+          JsonError(res, 401, "Invalid API key", "invalid_request_error");
+          return;
+        }
+        HandlePull(req, res);
+      });
+
+  oa::Route(svr, "POST", "/v1/models/load")
+      .Summary("Swap the active engine to a different model.")
+      .Tag("models")
+      .Body<LoadRequestDto>()
+      .Response<LoadResponseDto>(200)
+      .Response<ErrorResponseDto>(400, "Invalid request")
+      .Response<ErrorResponseDto>(401, "Invalid API key")
+      .Response<ErrorResponseDto>(500, "Load failed")
+      .Handler([&manager, &options](const httplib::Request& req,
+                                    httplib::Response& res) {
+        if (!Authorized(req, options)) {
+          JsonError(res, 401, "Invalid API key", "invalid_request_error");
+          return;
+        }
+        HandleLoad(manager, options, req, res);
+      });
+
+  oa::Route(svr, "POST", "/v1/chat/completions")
+      .Summary("OpenAI-compatible chat completions. Set stream=true for SSE.")
+      .Tag("chat")
+      .Body<ChatCompletionRequestDto>()
+      .Response<ChatCompletionResponseDto>(200, "Non-streaming completion")
+      .RawResponse(200, "Server-sent events when stream=true; each event is "
+                        "'data: <ChatCompletionChunk>\\n\\n', terminated by "
+                        "'data: [DONE]\\n\\n'.",
+                   "text/event-stream")
+      .Response<ErrorResponseDto>(400, "Invalid request")
+      .Response<ErrorResponseDto>(401, "Invalid API key")
+      .Response<ErrorResponseDto>(503, "Server busy or no model loaded")
+      .Handler([&manager, &options](const httplib::Request& req,
+                                    httplib::Response& res) {
+        HandleChatCompletions(manager, options, req, res);
+      });
+
+  // OpenAPI document. Built lazily on first request so all routes above are
+  // registered by the time we serialize.
+  svr.Get("/openapi.json",
+          [](const httplib::Request&, httplib::Response& res) {
+            auto spec = oa::BuildSpec("LiteRT Inference Server", LITERT_VERSION);
+            res.set_content(spec.dump(2), "application/json");
           });
 
-  svr.Post("/v1/chat/completions",
-           [&engine, &options](const httplib::Request& req,
-                               httplib::Response& res) {
-             HandleChatCompletions(engine, options, req, res);
-           });
+  // Swagger UI loaded from CDN. Tiny static HTML, no binary bloat.
+  svr.Get("/docs", [](const httplib::Request&, httplib::Response& res) {
+    static const char* kHtml = R"HTML(<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>LiteRT Inference API</title>
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script>
+    window.ui = SwaggerUIBundle({ url: '/openapi.json', dom_id: '#swagger-ui' });
+  </script>
+</body>
+</html>)HTML";
+    res.set_content(kHtml, "text/html");
+  });
 
   svr.set_logger([](const httplib::Request& req, const httplib::Response& res) {
     fprintf(stderr, "%s %s -> %d\n",
             req.method.c_str(), req.path.c_str(), res.status);
   });
 
-  fprintf(stderr, "Serving on http://%s:%d  model=%s  backend=%s\n",
-          options.host.c_str(), options.port,
-          engine.model_id().c_str(), engine.active_backend().c_str());
+  {
+    auto guard = manager.Acquire();
+    fprintf(stderr, "Serving on http://%s:%d  model=%s  backend=%s\n",
+            options.host.c_str(), options.port,
+            guard ? guard.engine().model_id().c_str() : "(none)",
+            guard ? guard.engine().active_backend().c_str() : "(none)");
+  }
 
   if (!svr.listen(options.host, options.port)) {
     fprintf(stderr, "Failed to bind %s:%d\n",

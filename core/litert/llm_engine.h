@@ -9,7 +9,7 @@
 namespace lite_inference {
 
 struct EngineOptions {
-  std::string backend      = "gpu"; // "gpu" | "cpu"
+  std::string backend      = "auto"; // "auto" (try gpu, fall back to cpu) | "gpu" | "cpu"
   bool multimodal          = false; // enable vision + audio sub-backends (cpu)
   bool mtp                 = false; // enable speculative decoding (multi-token prediction)
   bool force_gpu           = false; // hard-fail if GPU init fails; no CPU fallback

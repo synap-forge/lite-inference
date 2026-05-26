@@ -141,6 +141,7 @@ FetchContent_MakeAvailable(cpp_httplib nlohmann_json)
 add_executable(litert_server
   server/main.cc
   server/rest/openai_api.cc
+  server/rest/openapi.cc
   core/litert/llm_engine.cc
   core/litert/webgpu_sampler_shim.c
   hub/model_resolver.cc
@@ -213,8 +214,3 @@ endif()
 install(TARGETS litert_server DESTINATION bin)
 install(FILES "${LITERT_ENGINE_LIB}" DESTINATION bin)
 
-# ---------------------------------------------------------------------------
-# Library (mobile / Dart FFI target)
-# Pass LITERT_LM_DIR through so library/CMakeLists.txt doesn't re-search.
-# ---------------------------------------------------------------------------
-add_subdirectory(library)

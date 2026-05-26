@@ -112,6 +112,12 @@ jobs:
             VERSION="${{ needs.docker.outputs.version }}"
             IMAGE="ghcr.io/${{ github.repository }}:${VERSION}"
             echo "Deploying ${IMAGE}"
+
+            # Reclaim disk from prior deploys before pulling. Each lite-inference
+            # image is multi-GB; without this, /var fills up after ~20 releases.
+            # --volumes is omitted so litert-hf-cache (model files) is preserved.
+            podman image prune -a -f || true
+
             podman pull "${IMAGE}"
 
             # ---- model volume (persisted across restarts) -------------------

@@ -107,21 +107,28 @@ std::unique_ptr<LlmEngine> LlmEngine::Create(const std::string& model_path,
   self->impl_ = std::make_unique<Impl>();
   self->impl_->multimodal = opts.multimodal;
 
-  const bool want_gpu = (opts.backend == "gpu" || opts.backend == "GPU");
+  // "auto" tries GPU first and silently falls back to CPU. "gpu" also falls
+  // back unless --force_gpu is set. "cpu" skips the GPU attempt entirely.
+  const bool is_auto  = (opts.backend == "auto" || opts.backend == "AUTO" ||
+                         opts.backend.empty());
+  const bool want_gpu = is_auto ||
+                        (opts.backend == "gpu" || opts.backend == "GPU");
 
-  // vision_backend / audio_backend are only set when --multimodal is on.
+  // vision/audio sub-backends are only wired up when multimodal is requested.
   // Keeping them nullptr skips Gemma4DataProcessor init entirely, which
-  // eliminates the per-request ~100 ms multimodal setup overhead.
-  const char* vision_be = opts.multimodal ? "cpu" : nullptr;
-  const char* audio_be  = opts.multimodal ? "cpu" : nullptr;
-
-  auto try_create = [&](const char* backend_str) -> LiteRtLmEngine* {
+  // eliminates the per-request ~100 ms multimodal setup overhead. The fallback
+  // path in create_with_fallback() may also retry with multimodal disabled if
+  // the bundle lacks vision/audio sections.
+  auto try_create = [&](const char* backend_str, bool with_mtp,
+                        bool with_multimodal) -> LiteRtLmEngine* {
+    const char* v_be = with_multimodal ? "cpu" : nullptr;
+    const char* a_be = with_multimodal ? "cpu" : nullptr;
     LiteRtLmEngineSettings* settings =
         litert_lm_engine_settings_create(model_path.c_str(), backend_str,
-                                         vision_be, audio_be);
-    if (vision_be)
+                                         v_be, a_be);
+    if (v_be)
       litert_lm_engine_settings_set_max_num_images(settings, 1);
-    if (opts.mtp)
+    if (with_mtp)
       litert_lm_engine_settings_set_enable_speculative_decoding(settings, true);
     if (!opts.cache_dir.empty())
       litert_lm_engine_settings_set_cache_dir(settings, opts.cache_dir.c_str());
@@ -133,11 +140,43 @@ std::unique_ptr<LlmEngine> LlmEngine::Create(const std::string& model_path,
     return eng;
   };
 
+  // Attempts engine creation, falling back by disabling bundle-specific
+  // features the model may not support. Order: full → no-mtp → no-features.
+  // MTP requires a tf_lite_mtp_drafter section in the .litertlm; multimodal
+  // requires vision/audio encoders. Non-Gemma bundles often lack these.
+  auto create_with_fallback = [&](const char* backend_str) -> LiteRtLmEngine* {
+    bool want_mtp        = opts.mtp;
+    bool want_multimodal = opts.multimodal;
+
+    LiteRtLmEngine* eng = try_create(backend_str, want_mtp, want_multimodal);
+    if (eng) return eng;
+
+    if (want_mtp) {
+      fprintf(stderr, "[lite_inference] Engine init failed with +mtp; "
+                      "retrying without MTP (model may lack drafter section).\n");
+      eng = try_create(backend_str, false, want_multimodal);
+      if (eng) {
+        self->impl_->multimodal = want_multimodal;
+        return eng;
+      }
+    }
+    if (want_multimodal) {
+      fprintf(stderr, "[lite_inference] Engine init failed with +multimodal; "
+                      "retrying as text-only (model may lack vision/audio sections).\n");
+      eng = try_create(backend_str, false, false);
+      if (eng) {
+        self->impl_->multimodal = false;
+        return eng;
+      }
+    }
+    return nullptr;
+  };
+
   if (want_gpu) {
     fprintf(stderr, "[lite_inference] Initializing GPU (Metal) engine%s%s...\n",
             opts.multimodal ? " +multimodal" : "",
             opts.mtp        ? " +mtp"        : "");
-    self->impl_->engine = try_create("gpu");
+    self->impl_->engine = create_with_fallback("gpu");
     if (self->impl_->engine) {
       fprintf(stderr, "[lite_inference] GPU engine created successfully.\n");
       self->active_backend_ = "gpu";
@@ -151,9 +190,11 @@ std::unique_ptr<LlmEngine> LlmEngine::Create(const std::string& model_path,
   }
 
   if (!self->impl_->engine) {
-    self->impl_->engine = try_create("cpu");
+    self->impl_->engine = create_with_fallback("cpu");
     if (!self->impl_->engine) {
-      error_out = "Failed to create LiteRT-LM engine (tried cpu)";
+      error_out = "Failed to create LiteRT-LM engine (tried cpu, including "
+                  "fallbacks without mtp/multimodal). The .litertlm bundle is "
+                  "incompatible with this engine build.";
       return nullptr;
     }
     self->active_backend_ = "cpu";

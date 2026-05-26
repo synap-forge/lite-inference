@@ -1,8 +1,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <string>
 
+#include "core/engine_manager.h"
 #include "core/litert/llm_engine.h"
 #include "hub/model_resolver.h"
 #include "server/rest/openai_api.h"
@@ -22,7 +24,8 @@ static void Usage(const char* prog) {
     "  --hf_revision REV      HF revision/branch (default: main)\n"
     "\n"
     "Engine:\n"
-    "  --backend  BACKEND     gpu (default) | cpu\n"
+    "  --backend  BACKEND     auto (default) | gpu | cpu\n"
+    "                         'auto' tries GPU and falls back to CPU on failure\n"
     "  --force_gpu            Hard-fail if GPU init fails; no CPU fallback\n"
     "  --multimodal           Enable vision + audio sub-backends (cpu). Off by default\n"
     "                         to avoid per-request Gemma4DataProcessor overhead\n"
@@ -95,7 +98,7 @@ int main(int argc, char** argv) {
   const std::string model_id = resolve.model_path.empty() ? resolve.repo_id : "";
 
   lite_inference::EngineOptions engine_opts;
-  engine_opts.backend    = GetArg(argc, argv, "--backend", "gpu");
+  engine_opts.backend    = GetArg(argc, argv, "--backend", "auto");
   engine_opts.force_gpu  = HasFlag(argc, argv, "--force_gpu");
   engine_opts.multimodal = HasFlag(argc, argv, "--multimodal");
   engine_opts.mtp        = HasFlag(argc, argv, "--mtp");
@@ -110,10 +113,49 @@ int main(int argc, char** argv) {
 
   engine->Warmup();
 
+  lite_inference::EngineManager manager(std::move(engine));
+
   lite_inference::ServerOptions opts;
   opts.host    = GetArg(argc, argv, "--host",    "0.0.0.0");
   opts.port    = std::atoi(GetArg(argc, argv, "--port", "8080"));
   opts.api_key = GetArg(argc, argv, "--api_key");
 
-  return lite_inference::RunServer(*engine, opts);
+  // Factory used by POST /v1/models/load to hot-swap models.
+  //
+  // Inheritance: backend + cache/dispatch paths carry over from startup so
+  // GPU selection and prebuilt-lib lookup work identically across loads.
+  // mtp and multimodal do NOT inherit — they are Gemma-family bundle features
+  // (the .litertlm needs MTP drafter / vision encoder sections), so applying
+  // them to a fresh model that wasn't built with those sections causes
+  // engine init to fail with RET_CHECK_NE(embedding_lookup, nullptr) etc.
+  // Callers opt in per request: {"mtp": true} or {"multimodal": true}.
+  const lite_inference::EngineOptions startup_opts = engine_opts;
+  opts.build_engine =
+      [startup_opts](const lite_inference::ServerOptions::LoadRequest& req,
+                     std::string& err) -> std::unique_ptr<lite_inference::EngineBase> {
+        lite_inference::ResolveOptions ro;
+        ro.repo_id  = req.repo_id;
+        ro.filename = req.filename;
+        if (!req.revision.empty()) ro.revision = req.revision;
+
+        std::string path = lite_inference::ResolveModel(ro, err);
+        if (path.empty()) return nullptr;
+
+        lite_inference::EngineOptions eo;
+        eo.backend          = startup_opts.backend;
+        eo.force_gpu        = startup_opts.force_gpu;
+        eo.cache_dir        = startup_opts.cache_dir;
+        eo.dispatch_lib_dir = startup_opts.dispatch_lib_dir;
+        // Per-request opt-ins for bundle-specific features.
+        eo.mtp        = req.has_mtp        ? req.mtp        : false;
+        eo.multimodal = req.has_multimodal ? req.multimodal : false;
+        if (!req.backend.empty()) eo.backend = req.backend;
+
+        auto next = lite_inference::LlmEngine::Create(path, req.repo_id, eo, err);
+        if (!next) return nullptr;
+        next->Warmup();
+        return next;
+      };
+
+  return lite_inference::RunServer(manager, opts);
 }

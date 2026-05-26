@@ -183,8 +183,13 @@ if(APPLE)
     COMMENT "Copying runtime dylibs and making build self-contained"
   )
 elseif(UNIX)
+  # Bake $ORIGIN into the build-tree binary so it can be copied straight
+  # out of /build/ into a runtime image without needing `cmake --install`.
+  # libLiteRtLmEngine.so is copied next to the binary by the POST_BUILD step
+  # below, so $ORIGIN resolves correctly in both the build tree and the
+  # final image.
   set_target_properties(litert_server PROPERTIES
-    BUILD_RPATH "${CMAKE_BINARY_DIR}"
+    BUILD_WITH_INSTALL_RPATH TRUE
     INSTALL_RPATH "$ORIGIN"
   )
   add_custom_command(TARGET litert_server POST_BUILD

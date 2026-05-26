@@ -127,12 +127,25 @@ jobs:
               --port 8080
 
             # ---- verify -----------------------------------------------------
+            # Give the container a moment to settle before inspecting state.
+            sleep 5
+
             echo ""
             echo "=== Deployment verification ==="
-            podman ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" \
-              | grep litert-server
+            podman ps -a --filter name=litert-server \
+              --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+
+            STATE=$(podman inspect -f '{{.State.Status}}' litert-server 2>/dev/null || echo missing)
+            echo "Container state: ${STATE}"
+
+            if [ "${STATE}" != "running" ]; then
+              echo ""
+              echo "=== Container is not running — last 200 log lines ==="
+              podman logs --tail 200 litert-server || true
+              exit 1
+            fi
 
             echo ""
             echo "=== Health check ==="
-            sleep 3
-            curl -sf http://localhost:8090/health && echo " OK" || echo " (not ready yet — model may still be loading)"
+            curl -sf http://localhost:8090/health && echo " OK" || \
+              echo " (not ready yet — model may still be loading)"

@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       git git-lfs clang cmake ninja-build \
       libssl-dev \
       python3 openjdk-17-jdk-headless \
-      curl ca-certificates && \
+      curl ca-certificates patchelf && \
     rm -rf /var/lib/apt/lists/*
 
 # Install bazelisk (pick binary matching the build platform)
@@ -53,6 +53,17 @@ RUN cmake -B /build \
       -Wno-dev \
       -S /src && \
     cmake --build /build -j$(nproc)
+
+# Bazel links libLiteRtLmEngine.so with its build-time absolute path as the
+# SONAME, so the runtime loader looks for that exact path and fails. Rewrite
+# the SONAME to the bare filename so $ORIGIN-based RPATH resolution works.
+# Also drop the bazel RUNPATH that points into /src.
+RUN patchelf --set-soname libLiteRtLmEngine.so /build/libLiteRtLmEngine.so && \
+    patchelf --remove-rpath /build/libLiteRtLmEngine.so && \
+    patchelf --replace-needed \
+      /src/LiteRT-LM/bazel-bin/lite_inference_server/libLiteRtLmEngine.so \
+      libLiteRtLmEngine.so \
+      /build/litert_server || true
 
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime — minimal Ubuntu 24.04

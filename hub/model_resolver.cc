@@ -71,28 +71,56 @@ std::string FindCached(const fs::path& repo_dir, const std::string& revision,
   return "";
 }
 
-// Downloads via the `curl` CLI which handles HF's redirect chain (huggingface.co
-// → xethub CDN with pre-signed URLs) correctly out of the box, including
-// proper TLS/SNI handling that httplib struggles with on the xethub CDN.
-bool HttpsDownload(const std::string& repo_id, const std::string& revision,
-                   const std::string& filename, const fs::path& dest,
+bool HasCommand(const std::string& name) {
+  // `command -v` is POSIX; exit 0 iff resolvable. >/dev/null silences output.
+  std::string probe = "command -v " + name + " >/dev/null 2>&1";
+  return std::system(probe.c_str()) == 0;
+}
+
+// aria2c: parallel ranged GETs (-x N connections per host, -s N splits per
+// file). Native resume via the .aria2 control file. Much faster on HF's
+// xethub CDN than single-stream curl, and more resilient to mid-stream drops.
+bool Aria2Download(const std::string& url, const fs::path& tmp,
                    std::string& error_out) {
-  const std::string url = "https://huggingface.co/" + repo_id +
-                          "/resolve/" + revision + "/" + filename;
+  const std::string base =
+      "aria2c --continue=true --auto-file-renaming=false"
+      " --max-connection-per-server=16 --split=16 --min-split-size=1M"
+      " --max-tries=0 --retry-wait=5"
+      " --connect-timeout=30 --timeout=60"
+      " --lowest-speed-limit=1K"
+      " --console-log-level=warn --summary-interval=5";
 
-  std::error_code ec;
-  fs::create_directories(dest.parent_path(), ec);
-  fs::path tmp = dest.string() + ".part";
+  std::string cmd = base +
+                    " --dir=\"" + tmp.parent_path().string() + "\""
+                    " --out=\"" + tmp.filename().string() + "\""
+                    " \"" + url + "\"";
+  const char* token = std::getenv("HF_TOKEN");
+  if (token && *token)
+    cmd = base +
+          " --header=\"Authorization: Bearer " + std::string(token) + "\""
+          " --dir=\"" + tmp.parent_path().string() + "\""
+          " --out=\"" + tmp.filename().string() + "\""
+          " \"" + url + "\"";
 
-  fprintf(stderr, "Downloading %s ...\n", url.c_str());
+  int rc = std::system(cmd.c_str());
+  if (rc != 0) {
+    error_out = "aria2c failed (exit " + std::to_string(rc) + ") for " + url;
+    return false;
+  }
+  return true;
+}
 
-  // --continue-at - resumes from existing .part size; --retry handles
-  // transient network errors (HF/xethub CDN occasionally drops mid-stream).
+// Curl fallback for environments where aria2c isn't available (e.g. local dev
+// builds outside the container). Single-stream but with aggressive resume.
+bool CurlDownload(const std::string& url, const fs::path& tmp,
+                  std::string& error_out) {
   const std::string base_flags =
       "curl --location --fail --progress-bar"
       " --continue-at -"
-      " --retry 5 --retry-delay 2 --retry-all-errors"
-      " --connect-timeout 30";
+      " --retry 50 --retry-delay 5 --retry-all-errors"
+      " --retry-max-time 0"
+      " --connect-timeout 30"
+      " --speed-limit 1024 --speed-time 20";
 
   std::string cmd = base_flags +
                     " --output " + std::string(tmp) +
@@ -106,11 +134,32 @@ bool HttpsDownload(const std::string& repo_id, const std::string& revision,
 
   int rc = std::system(cmd.c_str());
   if (rc != 0) {
-    // Keep .part on failure so the next run can resume via --continue-at.
     error_out = "curl failed (exit " + std::to_string(rc) + ") for " + url +
                 (rc == 22 ? " (HTTP error — check HF_TOKEN for gated repos)" : "");
     return false;
   }
+  return true;
+}
+
+// Resolves HF's redirect chain (huggingface.co → xethub CDN with pre-signed
+// URLs). Prefers aria2c for parallel ranged downloads; falls back to curl.
+bool HttpsDownload(const std::string& repo_id, const std::string& revision,
+                   const std::string& filename, const fs::path& dest,
+                   std::string& error_out) {
+  const std::string url = "https://huggingface.co/" + repo_id +
+                          "/resolve/" + revision + "/" + filename;
+
+  std::error_code ec;
+  fs::create_directories(dest.parent_path(), ec);
+  fs::path tmp = dest.string() + ".part";
+
+  fprintf(stderr, "Downloading %s ...\n", url.c_str());
+
+  bool ok = HasCommand("aria2c")
+                ? Aria2Download(url, tmp, error_out)
+                : CurlDownload(url, tmp, error_out);
+  // Keep .part on failure so the next run can resume.
+  if (!ok) return false;
 
   fs::rename(tmp, dest, ec);
   if (ec) { error_out = "Cannot rename " + tmp.string(); return false; }

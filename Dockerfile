@@ -98,7 +98,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LITERT_VERSION=${VERSION}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      libssl3 libstdc++6 ca-certificates curl && \
+      libssl3 libstdc++6 ca-certificates curl aria2 && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

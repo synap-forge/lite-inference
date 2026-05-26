@@ -2,9 +2,9 @@ name: Deploy
 
 on:
   push:
-    branches: [main]
     tags:
       - "v*"
+  workflow_dispatch:   # allow manual runs from the Actions UI
 
 env:
   REGISTRY: ghcr.io

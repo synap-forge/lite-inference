@@ -86,19 +86,27 @@ bool HttpsDownload(const std::string& repo_id, const std::string& revision,
 
   fprintf(stderr, "Downloading %s ...\n", url.c_str());
 
-  std::string cmd = "curl --location --fail --progress-bar"
+  // --continue-at - resumes from existing .part size; --retry handles
+  // transient network errors (HF/xethub CDN occasionally drops mid-stream).
+  const std::string base_flags =
+      "curl --location --fail --progress-bar"
+      " --continue-at -"
+      " --retry 5 --retry-delay 2 --retry-all-errors"
+      " --connect-timeout 30";
+
+  std::string cmd = base_flags +
                     " --output " + std::string(tmp) +
                     " \"" + url + "\"";
   const char* token = std::getenv("HF_TOKEN");
   if (token && *token)
-    cmd = "curl --location --fail --progress-bar"
+    cmd = base_flags +
           " --header \"Authorization: Bearer " + std::string(token) + "\""
           " --output " + std::string(tmp) +
           " \"" + url + "\"";
 
   int rc = std::system(cmd.c_str());
   if (rc != 0) {
-    fs::remove(tmp, ec);
+    // Keep .part on failure so the next run can resume via --continue-at.
     error_out = "curl failed (exit " + std::to_string(rc) + ") for " + url +
                 (rc == 22 ? " (HTTP error — check HF_TOKEN for gated repos)" : "");
     return false;

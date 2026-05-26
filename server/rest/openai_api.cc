@@ -1,5 +1,9 @@
 #include "server/rest/openai_api.h"
 
+#ifndef LITERT_VERSION
+#define LITERT_VERSION "dev"
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -351,6 +355,7 @@ int RunServer(EngineBase& engine, const ServerOptions& options) {
   svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
     std::lock_guard<std::mutex> lk(g_queue.mtx);
     json out = {{"status", "ok"},
+                {"version", LITERT_VERSION},
                 {"queue", {{"active",  g_queue.active},
                            {"waiting", g_queue.waiting},
                            {"capacity", InferenceQueue::kMaxQueue}}}};

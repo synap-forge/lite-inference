@@ -3,6 +3,10 @@
 # ---------------------------------------------------------------------------
 FROM ubuntu:24.04 AS builder
 
+# Set by CI from the git tag (e.g. "v1.2.3"). Defaults to "dev" for
+# local builds. Baked into the binary via -DLITERT_VERSION.
+ARG VERSION=dev
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -49,28 +53,49 @@ RUN cmake -B /build \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_C_COMPILER=clang \
       -DCMAKE_CXX_COMPILER=clang++ \
+      -DLITERT_VERSION="${VERSION}" \
       -GNinja \
       -Wno-dev \
       -S /src && \
     cmake --build /build -j$(nproc)
 
-# Bazel links libLiteRtLmEngine.so with its build-time absolute path as the
-# SONAME, so the runtime loader looks for that exact path and fails. Rewrite
-# the SONAME to the bare filename so $ORIGIN-based RPATH resolution works.
-# Also drop the bazel RUNPATH that points into /src.
-RUN patchelf --set-soname libLiteRtLmEngine.so /build/libLiteRtLmEngine.so && \
-    patchelf --remove-rpath /build/libLiteRtLmEngine.so && \
-    patchelf --replace-needed \
-      /src/LiteRT-LM/bazel-bin/lite_inference_server/libLiteRtLmEngine.so \
-      libLiteRtLmEngine.so \
-      /build/litert_server || true
+# Bazel records build-time absolute paths as SONAMEs and NEEDED entries on
+# the shared libs it produces, which the runtime loader then can't resolve.
+# Normalise all the libs we ship so they reference each other by bare
+# filename, with $ORIGIN as their RPATH.
+RUN set -eux; \
+    # Stage every .so we ship into /build/ so the patching loop sees them.
+    cp /src/LiteRT-LM/prebuilt/linux_arm64/*.so /build/; \
+    # Engine .so: fix its SONAME and clear bazel-injected RPATH.
+    patchelf --set-soname libLiteRtLmEngine.so /build/libLiteRtLmEngine.so; \
+    # Every .so we ship: bare-name SONAME, $ORIGIN RPATH, rewrite any
+    # NEEDED entry that's still an absolute path to its basename.
+    for lib in /build/*.so; do \
+      patchelf --set-rpath '$ORIGIN' "$lib"; \
+      for need in $(patchelf --print-needed "$lib"); do \
+        case "$need" in /*) \
+          patchelf --replace-needed "$need" "$(basename "$need")" "$lib" ;; \
+        esac; \
+      done; \
+    done; \
+    # Same NEEDED-path cleanup on the server binary.
+    for need in $(patchelf --print-needed /build/litert_server); do \
+      case "$need" in /*) \
+        patchelf --replace-needed "$need" "$(basename "$need")" /build/litert_server ;; \
+      esac; \
+    done
 
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime — minimal Ubuntu 24.04
 # ---------------------------------------------------------------------------
 FROM ubuntu:24.04 AS runtime
 
-ENV DEBIAN_FRONTEND=noninteractive
+ARG VERSION=dev
+LABEL org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.source="https://github.com/synap-forge/lite-inference"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LITERT_VERSION=${VERSION}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       libssl3 libstdc++6 ca-certificates && \
@@ -78,10 +103,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY --from=builder /build/litert_server         ./litert_server
-COPY --from=builder /build/libLiteRtLmEngine.so  ./libLiteRtLmEngine.so
+COPY --from=builder /build/litert_server ./litert_server
+# Engine .so + LiteRT prebuilt delegate/constraint-provider .so's, all
+# staged and patchelf'd in /build/ during the builder stage so they
+# reference each other by bare name with $ORIGIN RPATH.
+COPY --from=builder /build/*.so ./
 
-# libLiteRtLmEngine.so is next to the binary; CMake sets RPATH=$ORIGIN
+# All deps sit next to the binary; RPATH=$ORIGIN
 # so no LD_LIBRARY_PATH needed.
 ENV HF_HOME=/data/huggingface
 

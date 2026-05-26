@@ -46,9 +46,12 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # On a v* tag: 1.2.3, 1.2, latest. On a branch push: branch name +
+          # sha-<short>. `latest` only moves when a tag ships.
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=ref,event=branch
             type=sha,prefix=sha-,format=short
 
@@ -70,6 +73,10 @@ jobs:
           platforms: linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # `version` from metadata is "1.2.3" for tag v1.2.3, branch name
+          # otherwise. Baked into the binary via Dockerfile ARG.
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
           cache-to:   type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
 
@@ -80,7 +87,9 @@ jobs:
     name: Deploy to Oracle Linux
     needs: docker
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
+    # Only tag pushes deploy to production. Pushes to main just build the
+    # branch image so it can be smoke-tested before tagging.
+    if: startsWith(github.ref, 'refs/tags/v')
 
     steps:
       - name: Deploy via SSH
@@ -98,12 +107,11 @@ jobs:
               podman login ghcr.io -u '${{ github.actor }}' --password-stdin
 
             # ---- resolve image tag ------------------------------------------
+            # Deploy only runs on v* tags, so VERSION is always the semver
+            # (e.g. "1.2.3") emitted by docker/metadata-action.
             VERSION="${{ needs.docker.outputs.version }}"
-            if [ -z "$VERSION" ]; then
-              VERSION="main"
-            fi
             IMAGE="ghcr.io/${{ github.repository }}:${VERSION}"
-            echo "Pulling ${IMAGE} ..."
+            echo "Deploying ${IMAGE}"
             podman pull "${IMAGE}"
 
             # ---- model volume (persisted across restarts) -------------------
@@ -147,5 +155,9 @@ jobs:
 
             echo ""
             echo "=== Health check ==="
-            curl -sf http://localhost:8090/health && echo " OK" || \
-              echo " (not ready yet — model may still be loading)"
+            if HEALTH=$(curl -sf http://localhost:8090/health); then
+              echo "OK: ${HEALTH}"
+              echo "Deployed version: ${VERSION}"
+            else
+              echo "(not ready yet — model may still be loading)"
+            fi

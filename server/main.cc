@@ -7,6 +7,10 @@
 #include "hub/model_resolver.h"
 #include "server/rest/openai_api.h"
 
+#ifndef LITERT_VERSION
+#define LITERT_VERSION "dev"
+#endif
+
 static void Usage(const char* prog) {
   fprintf(stderr,
     "Usage: %s [options]\n"
@@ -30,7 +34,9 @@ static void Usage(const char* prog) {
     "  --port     PORT        Listen port (default: 8080)\n"
     "  --api_key  KEY         Require Authorization: Bearer KEY\n"
     "\n"
-    "Env vars: HF_HOME (cache root), HF_TOKEN (private repos)\n",
+    "Env vars: HF_HOME (cache root), HF_TOKEN (private repos)\n"
+    "\n"
+    "  --version, -V          Print version and exit\n",
     prog);
 }
 
@@ -60,10 +66,15 @@ static int GetOptionalInt(int argc, char** argv, const char* flag, int fallback)
 }
 
 int main(int argc, char** argv) {
-  for (int i = 1; i < argc; ++i)
+  for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
       Usage(argv[0]); return 0;
     }
+    if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
+      printf("%s\n", LITERT_VERSION);
+      return 0;
+    }
+  }
 
   lite_inference::ResolveOptions resolve;
   resolve.model_path  = GetArg(argc, argv, "--model_path");

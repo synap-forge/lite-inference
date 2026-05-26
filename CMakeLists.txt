@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
 project(lite_inference VERSION 1.0 LANGUAGES CXX C)
 
+# Build version string. Set by CI from the git tag (e.g. "v1.2.3"); falls
+# back to "dev" for local builds. Surfaced via --version and /health.
+if(NOT DEFINED LITERT_VERSION OR LITERT_VERSION STREQUAL "")
+  set(LITERT_VERSION "dev")
+endif()
+
 # ---------------------------------------------------------------------------
 # C++ 20 baseline — enforced for all targets in this project.
 # CMAKE_CXX_EXTENSIONS OFF disables -std=gnu++20 so we get strict -std=c++20.
@@ -157,6 +163,7 @@ target_link_libraries(litert_server PRIVATE
 
 target_compile_definitions(litert_server PRIVATE
   CPPHTTPLIB_OPENSSL_SUPPORT
+  LITERT_VERSION="${LITERT_VERSION}"
 )
 
 if(APPLE)

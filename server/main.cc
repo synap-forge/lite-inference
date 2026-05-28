@@ -239,7 +239,7 @@ int main(int argc, char** argv) {
   std::unique_ptr<lite_inference::EmbeddingEngine> embed_engine;
   const std::string embed_repo = GetArg(argc, argv, "--embed_repo");
   if (!std::string(embed_repo).empty()) {
-    if (!engine) {
+    if (startup_load == "none") {
       fprintf(stderr, "Error: --embed_repo requires the LLM engine to be loaded "
                       "(cannot use with --startup_load=none alone).\n");
       return 1;

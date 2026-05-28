@@ -1,4 +1,5 @@
 #include "server/rest/openai_api.h"
+#include "core/litert/embedding_engine.h"
 
 #ifndef LITERT_VERSION
 #define LITERT_VERSION "dev"
@@ -253,6 +254,22 @@ void HandleChatCompletions(EngineManager& manager, const ServerOptions& opts,
     return;
   }
 
+  // Lazy startup: if engine is null and a lazy builder is configured, init now
+  // on the first incoming request. Drop the probe guard before taking the write
+  // lock inside EnsureLoaded to avoid shared/exclusive lock inversion.
+  // The "model" field from the request body is forwarded as the hint so the
+  // lazy builder can resolve the correct repo without --hf_repo at startup.
+  if (!manager.Acquire() && opts.lazy_builder) {
+    const std::string model_hint = body.value("model", "");
+    std::string lazy_err;
+    if (!manager.EnsureLoaded(
+            [&](std::string& e) { return opts.lazy_builder(model_hint, e); },
+            lazy_err)) {
+      JsonError(res, 503, "Model load failed: " + lazy_err, "server_error");
+      return;
+    }
+  }
+
   // Pin the active engine for the entire request. While this guard is held,
   // POST /v1/models/load will block (it takes the unique lock).
   auto guard = std::make_shared<EngineManager::Guard>(manager.Acquire());
@@ -399,6 +416,10 @@ bool ParseLoadRequest(const json& body, ServerOptions::LoadRequest& out,
   if (body.contains("mtp") && body["mtp"].is_boolean()) {
     out.has_mtp = true;
     out.mtp     = body["mtp"].get<bool>();
+  }
+  if (body.contains("context_length") && body["context_length"].is_number_integer()) {
+    int v = body["context_length"].get<int>();
+    if (v > 0) out.context_length = static_cast<size_t>(v);
   }
   return true;
 }
@@ -579,7 +600,9 @@ struct QueueDto {
 struct EngineInfoDto {
   std::optional<std::string> model;
   std::optional<std::string> backend;
-  LITERT_REFLECT(EngineInfoDto, model, backend)
+  std::optional<bool>        multimodal;
+  std::optional<bool>        mtp;
+  LITERT_REFLECT(EngineInfoDto, model, backend, multimodal, mtp)
 };
 
 struct HealthResponseDto {
@@ -602,6 +625,96 @@ struct ErrorResponseDto {
   LITERT_REFLECT(ErrorResponseDto, error)
 };
 
+struct EmbeddingRequestDto {
+  std::string                 model;
+  std::string                 input;   // string or array; described as string here
+  std::optional<std::string>  encoding_format;
+  LITERT_REFLECT(EmbeddingRequestDto, model, input, encoding_format)
+};
+
+struct EmbeddingObjectDto {
+  std::string        object;  // "embedding"
+  int                index = 0;
+  std::vector<float> embedding;
+  LITERT_REFLECT(EmbeddingObjectDto, object, index, embedding)
+};
+
+struct EmbeddingUsageDto {
+  int prompt_tokens = 0;
+  int total_tokens  = 0;
+  LITERT_REFLECT(EmbeddingUsageDto, prompt_tokens, total_tokens)
+};
+
+struct EmbeddingResponseDto {
+  std::string                    object;  // "list"
+  std::vector<EmbeddingObjectDto> data;
+  std::string                    model;
+  EmbeddingUsageDto              usage;
+  LITERT_REFLECT(EmbeddingResponseDto, object, data, model, usage)
+};
+
+void HandleEmbeddings(const ServerOptions& opts,
+                      const httplib::Request& req,
+                      httplib::Response& res) {
+  if (!opts.embedding_engine) {
+    JsonError(res, 501, "No embedding model loaded. "
+                        "Start the server with --embed_repo to enable /v1/embeddings.",
+              "not_implemented");
+    return;
+  }
+
+  json body;
+  try { body = json::parse(req.body); }
+  catch (const std::exception& e) {
+    JsonError(res, 400, std::string("Invalid JSON: ") + e.what(),
+              "invalid_request_error");
+    return;
+  }
+
+  // Collect input texts: either a single string or an array of strings.
+  std::vector<std::string> inputs;
+  if (!body.contains("input")) {
+    JsonError(res, 400, "'input' is required", "invalid_request_error");
+    return;
+  }
+  if (body["input"].is_string()) {
+    inputs.push_back(body["input"].get<std::string>());
+  } else if (body["input"].is_array()) {
+    for (const auto& item : body["input"]) {
+      if (!item.is_string()) {
+        JsonError(res, 400, "'input' array must contain strings only",
+                  "invalid_request_error");
+        return;
+      }
+      inputs.push_back(item.get<std::string>());
+    }
+  } else {
+    JsonError(res, 400, "'input' must be a string or array of strings",
+              "invalid_request_error");
+    return;
+  }
+
+  EmbeddingEngine& emb = *opts.embedding_engine;
+  json data = json::array();
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    std::string err;
+    std::vector<float> vec = emb.Embed(inputs[i], err);
+    if (!err.empty()) {
+      JsonError(res, 500, "Embedding failed: " + err, "internal_error");
+      return;
+    }
+    data.push_back({{"object", "embedding"},
+                    {"index", static_cast<int>(i)},
+                    {"embedding", vec}});
+  }
+
+  json out = {{"object", "list"},
+              {"data", data},
+              {"model", emb.model_id()},
+              {"usage", {{"prompt_tokens", 0}, {"total_tokens", 0}}}};
+  res.set_content(out.dump(), "application/json");
+}
+
 }  // namespace
 
 int RunServer(EngineManager& manager, const ServerOptions& options) {
@@ -616,8 +729,11 @@ int RunServer(EngineManager& manager, const ServerOptions& options) {
         auto guard = manager.Acquire();
         json engine_info = json::object();
         if (guard) {
-          engine_info["model"]   = guard.engine().model_id();
-          engine_info["backend"] = guard.engine().active_backend();
+          engine_info["model"]          = guard.engine().model_id();
+          engine_info["backend"]        = guard.engine().active_backend();
+          engine_info["multimodal"]     = guard.engine().multimodal();
+          engine_info["mtp"]            = guard.engine().mtp();
+          engine_info["context_length"] = guard.engine().context_length();
         }
         std::lock_guard<std::mutex> lk(g_queue.mtx);
         json out = {{"status", "ok"},
@@ -668,6 +784,22 @@ int RunServer(EngineManager& manager, const ServerOptions& options) {
           return;
         }
         HandleLoad(manager, options, req, res);
+      });
+
+  oa::Route(svr, "POST", "/v1/embeddings")
+      .Summary("OpenAI-compatible embeddings. Requires --embed_repo at startup.")
+      .Tag("embeddings")
+      .Body<EmbeddingRequestDto>()
+      .Response<EmbeddingResponseDto>(200)
+      .Response<ErrorResponseDto>(400, "Invalid request")
+      .Response<ErrorResponseDto>(401, "Invalid API key")
+      .Response<ErrorResponseDto>(501, "No embedding model loaded")
+      .Handler([&options](const httplib::Request& req, httplib::Response& res) {
+        if (!Authorized(req, options)) {
+          JsonError(res, 401, "Invalid API key", "invalid_request_error");
+          return;
+        }
+        HandleEmbeddings(options, req, res);
       });
 
   oa::Route(svr, "POST", "/v1/chat/completions")

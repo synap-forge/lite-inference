@@ -56,6 +56,9 @@ LiteRtLmConversationOptionalArgs* MakeOptionalArgs(int visual_token_budget) {
   return args;
 }
 
+// Returns true if the message contains at least one image or audio attachment.
+bool HasMedia(const ChatMessage& m) { return !m.media.empty(); }
+
 LiteRtLmConversationConfig* MakeConversationConfig(
     const GenerationParams& params) {
   LiteRtLmSamplerParams sampler{};
@@ -87,17 +90,72 @@ std::string ExtractTextFromChunk(const char* chunk) {
   }
 }
 
+// Returns the number of tokens in `text` according to the engine's tokenizer.
+// Returns 0 on failure (safe to use as an undercount — callers won't trim more
+// than necessary).
+size_t CountTokens(LiteRtLmEngine* engine, const std::string& text) {
+  if (text.empty()) return 0;
+  LiteRtLmTokenizeResult* r = litert_lm_engine_tokenize(engine, text.c_str());
+  if (!r) return 0;
+  size_t n = litert_lm_tokenize_result_get_num_tokens(r);
+  litert_lm_tokenize_result_delete(r);
+  return n;
+}
+
+// Trims `messages` so the total token count of all text content fits within
+// `limit` tokens, preserving:
+//   - messages[0] if it is a "system" message (always kept)
+//   - messages.back() (the current user turn — always kept)
+// Drops the oldest non-system turns first.
+// Returns the number of messages dropped (0 = no trim needed).
+int TrimToContextLimit(LiteRtLmEngine* engine,
+                       std::vector<ChatMessage>& messages,
+                       size_t limit) {
+  if (messages.size() < 2) return 0;  // nothing droppable
+
+  // Leave ~20% headroom for image/audio tokens not counted here.
+  const size_t effective_limit = limit * 4 / 5;
+
+  auto token_count = [&](const ChatMessage& m) -> size_t {
+    return CountTokens(engine, m.content);
+  };
+
+  size_t total = 0;
+  for (const auto& m : messages) total += token_count(m);
+  if (total <= effective_limit) return 0;
+
+  // Keep messages[0] if it is a system prompt; always keep messages.back().
+  const size_t first_droppable = (!messages.empty() && messages[0].role == "system") ? 1 : 0;
+
+  int dropped = 0;
+  // Erase oldest droppable turns one at a time; stop when only the last
+  // message (current user turn) would remain after first_droppable.
+  while (total > effective_limit && first_droppable + 1 < messages.size()) {
+    total -= token_count(messages[first_droppable]);
+    messages.erase(messages.begin() + static_cast<ptrdiff_t>(first_droppable));
+    ++dropped;
+  }
+  return dropped;
+}
+
 }  // namespace
 
 struct LlmEngine::Impl {
   LiteRtLmEngine* engine = nullptr;
   bool multimodal        = false;
+  bool mtp               = false;
+  size_t max_num_tokens  = 0;  // parsed from ekv#### in model filename; 0 = unknown
 };
 
 LlmEngine::~LlmEngine() {
   if (impl_ && impl_->engine)
     litert_lm_engine_delete(impl_->engine);
 }
+
+bool            LlmEngine::multimodal()     const { return impl_ && impl_->multimodal; }
+bool            LlmEngine::mtp()            const { return impl_ && impl_->mtp; }
+size_t          LlmEngine::context_length() const { return impl_ ? impl_->max_num_tokens : 0; }
+LiteRtLmEngine* LlmEngine::raw_engine()     const { return impl_ ? impl_->engine : nullptr; }
 
 std::unique_ptr<LlmEngine> LlmEngine::Create(const std::string& model_path,
                                              const std::string& model_id,
@@ -106,6 +164,7 @@ std::unique_ptr<LlmEngine> LlmEngine::Create(const std::string& model_path,
   auto self = std::unique_ptr<LlmEngine>(new LlmEngine());
   self->impl_ = std::make_unique<Impl>();
   self->impl_->multimodal = opts.multimodal;
+  self->impl_->mtp        = opts.mtp;
 
   // "auto" tries GPU first and silently falls back to CPU. "gpu" also falls
   // back unless --force_gpu is set. "cpu" skips the GPU attempt entirely.
@@ -157,6 +216,7 @@ std::unique_ptr<LlmEngine> LlmEngine::Create(const std::string& model_path,
       eng = try_create(backend_str, false, want_multimodal);
       if (eng) {
         self->impl_->multimodal = want_multimodal;
+        self->impl_->mtp        = false;
         return eng;
       }
     }
@@ -166,6 +226,7 @@ std::unique_ptr<LlmEngine> LlmEngine::Create(const std::string& model_path,
       eng = try_create(backend_str, false, false);
       if (eng) {
         self->impl_->multimodal = false;
+        self->impl_->mtp        = false;
         return eng;
       }
     }
@@ -209,45 +270,84 @@ std::unique_ptr<LlmEngine> LlmEngine::Create(const std::string& model_path,
                           : model_path.substr(slash + 1);
   }
 
-  fprintf(stderr, "Engine ready: backend=%s multimodal=%s mtp=%s\n",
+  // Determine context window size. Prefer explicit opts.context_length;
+  // fall back to parsing ekv#### from the model filename.
+  if (opts.context_length > 0) {
+    self->impl_->max_num_tokens = opts.context_length;
+  } else {
+    auto pos = model_path.find("ekv");
+    if (pos != std::string::npos) {
+      size_t ekv = 0;
+      for (size_t i = pos + 3;
+           i < model_path.size() && std::isdigit((unsigned char)model_path[i]);
+           ++i)
+        ekv = ekv * 10 + (model_path[i] - '0');
+      if (ekv > 0) self->impl_->max_num_tokens = ekv;
+    }
+  }
+
+  fprintf(stderr, "Engine ready: backend=%s multimodal=%s mtp=%s ctx=%zu\n",
           self->active_backend_.c_str(),
           opts.multimodal ? "on" : "off",
-          opts.mtp ? "on" : "off");
+          opts.mtp ? "on" : "off",
+          self->impl_->max_num_tokens);
   return self;
 }
 
-void LlmEngine::Warmup() {
+bool LlmEngine::Warmup(std::string& error_out) {
   fprintf(stderr, "Warming up engine (first-request cold-start elimination)...\n");
   GenerationParams params;
   params.max_tokens = 1;
   params.temperature = 0.0f;
-  std::string err;
-  Generate({ChatMessage{"user", "hi"}}, params, err);
+  Generate({ChatMessage{"user", "hi"}}, params, error_out);
+  if (!error_out.empty()) {
+    fprintf(stderr, "Warmup failed: %s\n", error_out.c_str());
+    return false;
+  }
   fprintf(stderr, "Warmup complete.\n");
+  return true;
 }
 
 std::string LlmEngine::Generate(const std::vector<ChatMessage>& messages,
                                 const GenerationParams& params,
                                 std::string& error_out) {
+  std::vector<ChatMessage> trimmed = messages;
+  if (impl_->max_num_tokens > 0) {
+    int dropped = TrimToContextLimit(impl_->engine, trimmed, impl_->max_num_tokens);
+    if (dropped > 0)
+      fprintf(stderr, "[lite_inference] Context too long: dropped %d oldest turn(s) "
+                      "to fit within %zu-token limit.\n", dropped, impl_->max_num_tokens);
+  }
+  const std::vector<ChatMessage>& msgs = trimmed;
+
   LiteRtLmConversationConfig* conv_cfg = MakeConversationConfig(params);
   LiteRtLmConversation* conv =
       litert_lm_conversation_create(impl_->engine, conv_cfg);
   litert_lm_conversation_config_delete(conv_cfg);
   if (!conv) { error_out = "Failed to create conversation"; return {}; }
 
-  LiteRtLmConversationOptionalArgs* opt_args =
-      impl_->multimodal ? MakeOptionalArgs(params.visual_token_budget) : nullptr;
+  // opt_args is only passed for messages that actually contain media — passing
+  // it for text-only messages can trigger a null-deref inside
+  // ProcessAndCombineContents when the vision encoder isn't fully initialized.
+  auto make_args_for = [&](const ChatMessage& m) -> LiteRtLmConversationOptionalArgs* {
+    return (impl_->multimodal && HasMedia(m))
+               ? MakeOptionalArgs(params.visual_token_budget)
+               : nullptr;
+  };
 
   // Prefill all messages except the last via send_message (responses discarded),
   // then send the last message to trigger decode.
-  for (size_t i = 0; i + 1 < messages.size(); ++i) {
-    std::string prefill_json = BuildSingleMessageJson(messages[i]);
+  for (size_t i = 0; i + 1 < msgs.size(); ++i) {
+    std::string prefill_json = BuildSingleMessageJson(msgs[i]);
+    LiteRtLmConversationOptionalArgs* args = make_args_for(msgs[i]);
     LiteRtLmJsonResponse* r =
-        litert_lm_conversation_send_message(conv, prefill_json.c_str(), nullptr, opt_args);
+        litert_lm_conversation_send_message(conv, prefill_json.c_str(), nullptr, args);
+    if (args) litert_lm_conversation_optional_args_delete(args);
     if (r) litert_lm_json_response_delete(r);
   }
 
-  std::string msg_json = BuildSingleMessageJson(messages.back());
+  std::string msg_json = BuildSingleMessageJson(msgs.back());
+  LiteRtLmConversationOptionalArgs* opt_args = make_args_for(msgs.back());
   LiteRtLmJsonResponse* resp =
       litert_lm_conversation_send_message(conv, msg_json.c_str(), nullptr, opt_args);
   if (opt_args) litert_lm_conversation_optional_args_delete(opt_args);
@@ -299,24 +399,39 @@ bool LlmEngine::GenerateStream(const std::vector<ChatMessage>& messages,
     }
   };
 
+  std::vector<ChatMessage> trimmed = messages;
+  if (impl_->max_num_tokens > 0) {
+    int dropped = TrimToContextLimit(impl_->engine, trimmed, impl_->max_num_tokens);
+    if (dropped > 0)
+      fprintf(stderr, "[lite_inference] Context too long: dropped %d oldest turn(s) "
+                      "to fit within %zu-token limit.\n", dropped, impl_->max_num_tokens);
+  }
+  const std::vector<ChatMessage>& msgs = trimmed;
+
   LiteRtLmConversationConfig* conv_cfg = MakeConversationConfig(params);
   LiteRtLmConversation* conv =
       litert_lm_conversation_create(impl_->engine, conv_cfg);
   litert_lm_conversation_config_delete(conv_cfg);
   if (!conv) { error_out = "Failed to create conversation"; return false; }
 
-  LiteRtLmConversationOptionalArgs* opt_args =
-      impl_->multimodal ? MakeOptionalArgs(params.visual_token_budget) : nullptr;
+  auto make_args_for = [&](const ChatMessage& m) -> LiteRtLmConversationOptionalArgs* {
+    return (impl_->multimodal && HasMedia(m))
+               ? MakeOptionalArgs(params.visual_token_budget)
+               : nullptr;
+  };
 
   // Prefill all messages except the last, then stream the final decode.
-  for (size_t i = 0; i + 1 < messages.size(); ++i) {
-    std::string prefill_json = BuildSingleMessageJson(messages[i]);
+  for (size_t i = 0; i + 1 < msgs.size(); ++i) {
+    std::string prefill_json = BuildSingleMessageJson(msgs[i]);
+    LiteRtLmConversationOptionalArgs* args = make_args_for(msgs[i]);
     LiteRtLmJsonResponse* r =
-        litert_lm_conversation_send_message(conv, prefill_json.c_str(), nullptr, opt_args);
+        litert_lm_conversation_send_message(conv, prefill_json.c_str(), nullptr, args);
+    if (args) litert_lm_conversation_optional_args_delete(args);
     if (r) litert_lm_json_response_delete(r);
   }
 
-  std::string msg_json = BuildSingleMessageJson(messages.back());
+  std::string msg_json = BuildSingleMessageJson(msgs.back());
+  LiteRtLmConversationOptionalArgs* opt_args = make_args_for(msgs.back());
   int rc = litert_lm_conversation_send_message_stream(
       conv, msg_json.c_str(), nullptr, opt_args, callback, &state);
   if (opt_args) litert_lm_conversation_optional_args_delete(opt_args);

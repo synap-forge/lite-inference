@@ -116,4 +116,4 @@ ENV HF_HOME=/data/huggingface
 EXPOSE 8080
 
 ENTRYPOINT ["./litert_server"]
-CMD ["--backend", "cpu", "--port", "8080"]
+CMD ["--backend", "cpu", "--port", "8080", "--startup_load", "none", "--embed_repo", "litert-community/embeddinggemma-300m", "--embed_seq_len", "1024"]

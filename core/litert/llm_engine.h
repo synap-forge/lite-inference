@@ -6,6 +6,8 @@
 
 #include "core/engine.h"
 
+struct LiteRtLmEngine;
+
 namespace lite_inference {
 
 struct EngineOptions {
@@ -15,6 +17,9 @@ struct EngineOptions {
   bool force_gpu           = false; // hard-fail if GPU init fails; no CPU fallback
   std::string cache_dir;            // GPU shader/weight cache dir (empty = model dir)
   std::string dispatch_lib_dir;     // directory containing LiteRT accelerator plugins
+  size_t context_length    = 0;     // KV-cache context window in tokens.
+                                    // 0 = auto-detect from ekv#### in model filename.
+                                    // Set explicitly when loading models without ekv in name.
 };
 
 // LiteRT-LM backend. Model is loaded once at Create() time.
@@ -40,10 +45,17 @@ class LlmEngine : public EngineBase {
 
   // Runs a minimal inference to trigger lazy GPU/sampler initialization so the
   // first real request doesn't pay the cold-start cost.
-  void Warmup() override;
+  bool Warmup(std::string& error_out) override;
 
   const std::string& model_id()       const override { return model_id_; }
   const std::string& active_backend() const override { return active_backend_; }
+  bool               multimodal()     const override;
+  bool               mtp()            const override;
+  size_t             context_length() const override;
+
+  // Expose the raw LiteRT-LM engine pointer for use by EmbeddingEngine's
+  // tokenizer. The caller must not delete it.
+  LiteRtLmEngine*    raw_engine()     const;
 
  private:
   LlmEngine() = default;

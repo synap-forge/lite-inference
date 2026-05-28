@@ -64,6 +64,20 @@ class EngineManager {
     return true;
   }
 
+  // Initializes the engine via `build` only if it is currently null (lazy
+  // startup). No-op if the engine is already loaded. Thread-safe: concurrent
+  // callers race to take the write lock; the winner builds, losers see the
+  // result and return true.
+  bool EnsureLoaded(const Builder& build, std::string& error_out) {
+    { std::shared_lock<std::shared_mutex> lk(mtx_); if (engine_) return true; }
+    std::unique_lock<std::shared_mutex> lk(mtx_);
+    if (engine_) return true;
+    auto next = build(error_out);
+    if (!next) return false;
+    engine_ = std::move(next);
+    return true;
+  }
+
  private:
   std::shared_mutex            mtx_;
   std::unique_ptr<EngineBase>  engine_;

@@ -138,7 +138,10 @@ jobs:
               --restart unless-stopped \
               "${IMAGE}" \
               --backend cpu \
-              --port 8080
+              --port 8080 \
+              --startup_load partial \
+              --embed_repo litert-community/embeddinggemma-300m \
+              --embed_seq_len 1024
 
             # ---- verify -----------------------------------------------------
             # Give the container a moment to settle before inspecting state.

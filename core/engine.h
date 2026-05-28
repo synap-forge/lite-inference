@@ -47,10 +47,17 @@ class EngineBase {
                               const TokenCallback& on_token,
                               std::string& error_out) = 0;
 
-  virtual void Warmup() = 0;
+  // Runs a tiny inference to surface init errors (GPU sampler unavailable,
+  // missing bundle sections, etc.) before the engine starts taking real
+  // traffic. Returns true on success; on failure, `error_out` carries the
+  // engine-side message and the engine should not be used.
+  virtual bool Warmup(std::string& error_out) = 0;
 
   virtual const std::string& model_id()       const = 0;
   virtual const std::string& active_backend() const = 0;
+  virtual bool                multimodal()    const = 0;
+  virtual bool                mtp()           const = 0;
+  virtual size_t              context_length() const = 0;  // 0 = unknown
 };
 
 }  // namespace lite_inference

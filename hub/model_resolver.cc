@@ -18,6 +18,8 @@ namespace fs = std::filesystem;
 
 namespace {
 
+int ScoreFile(const std::string& name);  // defined below
+
 std::string EnvOr(const char* name, const std::string& fallback) {
   const char* v = std::getenv(name);
   return (v && *v) ? std::string(v) : fallback;
@@ -49,11 +51,13 @@ std::string ReadRef(const fs::path& repo_dir, const std::string& revision) {
 
 std::string FindModelFile(const fs::path& dir) {
   std::error_code ec;
+  std::string best;
+  int best_score = -1;
   for (const auto& e : fs::directory_iterator(dir, ec)) {
-    auto ext = e.path().extension();
-    if (ext == ".litertlm" || ext == ".tflite") return e.path().string();
+    int s = ScoreFile(e.path().filename().string());
+    if (s > best_score) { best_score = s; best = e.path().string(); }
   }
-  return "";
+  return best;
 }
 
 std::string FindCached(const fs::path& repo_dir, const std::string& revision,
@@ -165,8 +169,8 @@ int ScoreFile(const std::string& name) {
     int ekv = 0;
     for (size_t i = pos + 3; i < name.size() && std::isdigit((unsigned char)name[i]); ++i)
       ekv = ekv * 10 + (name[i] - '0');
-    if (ekv > 8192) ekv = 8192;  // cap so 1280 doesn't lose to a typo'd 99999.
-    score += ekv / 64;            // ekv1280 -> 20, ekv4096 -> 64.
+    if (ekv > 131072) ekv = 131072;  // cap at 128K (Gemma 3n E2B/E4B max ctx).
+    score += ekv / 64;                // ekv1280 -> 20, ekv4096 -> 64, ekv131072 -> 2048.
   }
 
   // Hardware-specific builds: should only be picked if nothing else exists.

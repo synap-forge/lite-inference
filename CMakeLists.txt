@@ -80,6 +80,18 @@ set(LITERT_LIB_PATH "${LITERT_PREBUILT_DIR}/${LITERT_LIB_NAME}")
 #   cd LiteRT-LM && bazelisk build //lite_inference_server:libLiteRtLmEngine.so
 #   cp bazel-bin/lite_inference_server/libLiteRtLmEngine.so \
 #      prebuilt/macos_arm64/libLiteRtLmEngine.so
+# LiteRt runtime library (for embedding / tflite inference).
+# Lives alongside the LM engine lib in the same prebuilt dir.
+if(WIN32)
+  set(LITERT_RUNTIME_LIB_FILE "libLiteRt.dll")
+  set(LITERT_RUNTIME_IMPORT_LIB "${LITERT_PREBUILT_DIR}/libLiteRt.lib")
+elseif(APPLE)
+  set(LITERT_RUNTIME_LIB_FILE "libLiteRt.dylib")
+else()
+  set(LITERT_RUNTIME_LIB_FILE "libLiteRt.so")
+endif()
+set(LITERT_RUNTIME_LIB "${LITERT_PREBUILT_DIR}/${LITERT_RUNTIME_LIB_FILE}")
+
 set(LITERT_ENGINE_LIB_NAME "libLiteRtLmEngine")
 if(WIN32)
   set(LITERT_ENGINE_LIB_FILE "${LITERT_ENGINE_LIB_NAME}.dll")
@@ -108,12 +120,32 @@ if(NOT EXISTS "${LITERT_ENGINE_LIB}")
     "Then copy it to ${LITERT_PREBUILT_DIR}/ to keep it stable.")
 endif()
 
-# Import the Bazel-built C API shared library.
+# Import the Bazel-built C API shared library (LM engine).
 add_library(litert_lm SHARED IMPORTED)
 set_target_properties(litert_lm PROPERTIES
   IMPORTED_LOCATION "${LITERT_ENGINE_LIB}"
   INTERFACE_INCLUDE_DIRECTORIES "${LITERT_LM_DIR}"
 )
+
+# Import the LiteRt runtime library (for tflite / embedding inference).
+if(EXISTS "${LITERT_RUNTIME_LIB}")
+  add_library(litert_runtime SHARED IMPORTED)
+  if(WIN32)
+    set_target_properties(litert_runtime PROPERTIES
+      IMPORTED_LOCATION "${LITERT_RUNTIME_LIB}"
+      IMPORTED_IMPLIB   "${LITERT_RUNTIME_IMPORT_LIB}"
+    )
+  else()
+    set_target_properties(litert_runtime PROPERTIES
+      IMPORTED_LOCATION "${LITERT_RUNTIME_LIB}"
+    )
+  endif()
+  set(HAVE_LITERT_RUNTIME TRUE)
+else()
+  message(WARNING "libLiteRt not found at ${LITERT_RUNTIME_LIB}; "
+                  "embedding engine will not be available.")
+  set(HAVE_LITERT_RUNTIME FALSE)
+endif()
 
 # ---------------------------------------------------------------------------
 # Third-party: cpp-httplib (header-only) + nlohmann/json (header-only)
@@ -124,11 +156,13 @@ include(FetchContent)
 FetchContent_Declare(cpp_httplib
   URL https://github.com/yhirose/cpp-httplib/archive/refs/tags/v0.18.3.tar.gz
   URL_HASH SHA256=a0567bcd6c3fe5cef1b329b96245119047f876b49e06cc129a36a7a8dffe173e
+  DOWNLOAD_EXTRACT_TIMESTAMP FALSE
 )
 FetchContent_Declare(nlohmann_json
   URL https://github.com/nlohmann/json/archive/refs/tags/v3.11.3.tar.gz
   URL_HASH SHA256=0d8ef5af7f9794e3263480193c491549b2ba6cc74bb018906202ada498a79406
   CMAKE_ARGS -DJSON_BuildTests=OFF
+  DOWNLOAD_EXTRACT_TIMESTAMP FALSE
 )
 
 set(HTTPLIB_COMPILE OFF CACHE BOOL "" FORCE)   # keep header-only
@@ -143,6 +177,7 @@ add_executable(litert_server
   server/rest/openai_api.cc
   server/rest/openapi.cc
   core/litert/llm_engine.cc
+  core/litert/embedding_engine.cc
   core/litert/webgpu_sampler_shim.c
   hub/model_resolver.cc
 )
@@ -162,6 +197,11 @@ target_link_libraries(litert_server PRIVATE
   OpenSSL::Crypto
 )
 
+if(HAVE_LITERT_RUNTIME)
+  target_link_libraries(litert_server PRIVATE litert_runtime)
+  target_compile_definitions(litert_server PRIVATE HAVE_LITERT_RUNTIME=1)
+endif()
+
 target_compile_definitions(litert_server PRIVATE
   CPPHTTPLIB_OPENSSL_SUPPORT
   LITERT_VERSION="${LITERT_VERSION}"
@@ -179,6 +219,19 @@ if(APPLE)
   # The engine lib's recorded install name depends on where Bazel built it, so
   # we derive it at build time with otool rather than hardcoding the bazel path.
   file(GLOB LITERT_PREBUILT_DYLIBS "${LITERT_PREBUILT_DIR}/*.dylib")
+  # The macos_arm64 prebuilts ship libLiteRtWebGpuAccelerator.dylib + its paired
+  # libLiteRtTopKWebGpuSampler.dylib, but the sampler dylib was built against
+  # an older API and is missing 4 of 7 expected C entrypoints (notably
+  # LiteRtTopKWebGpuSampler_UpdateConfig). When the WebGPU accelerator is
+  # loaded, the sampler factory tries WebGPU first, fails, then falls back to
+  # the CPU sampler, which then crashes trying to read GPU-resident logits
+  # (top_p_cpu_sampler.cc -> litert_tensor_buffer ERROR). Symptom: warmup or
+  # first inference fails with INTERNAL on Apple Silicon.
+  #
+  # Excluding both dylibs forces the sampler factory down its Metal path,
+  # which works correctly with libLiteRtTopKMetalSampler.dylib. Re-enable
+  # once upstream ships a complete WebGPU sampler for macOS.
+  list(FILTER LITERT_PREBUILT_DYLIBS EXCLUDE REGEX "libLiteRt(TopK)?WebGpu[A-Za-z]*\\.dylib$")
   add_custom_command(TARGET litert_server POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${LITERT_ENGINE_LIB}"
@@ -186,6 +239,9 @@ if(APPLE)
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${LITERT_PREBUILT_DYLIBS}
             "$<TARGET_FILE_DIR:litert_server>/"
+    COMMAND ${CMAKE_COMMAND} -E rm -f
+            "$<TARGET_FILE_DIR:litert_server>/libLiteRtWebGpuAccelerator.dylib"
+            "$<TARGET_FILE_DIR:litert_server>/libLiteRtTopKWebGpuSampler.dylib"
     COMMAND /bin/sh "${CMAKE_SOURCE_DIR}/cmake/make_portable.sh"
             "$<TARGET_FILE_DIR:litert_server>"
     COMMENT "Copying runtime dylibs and making build self-contained"
@@ -206,6 +262,14 @@ elseif(UNIX)
             "$<TARGET_FILE_DIR:litert_server>/libLiteRtLmEngine.so"
     COMMENT "Copying libLiteRtLmEngine.so next to binary"
   )
+  if(HAVE_LITERT_RUNTIME)
+    add_custom_command(TARGET litert_server POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "${LITERT_RUNTIME_LIB}"
+              "$<TARGET_FILE_DIR:litert_server>/libLiteRt.so"
+      COMMENT "Copying libLiteRt.so next to binary"
+    )
+  endif()
 endif()
 
 # ---------------------------------------------------------------------------

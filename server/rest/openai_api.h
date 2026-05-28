@@ -5,6 +5,7 @@
 
 #include "core/engine.h"
 #include "core/engine_manager.h"
+#include "core/litert/embedding_engine.h"
 
 namespace lite_inference {
 
@@ -28,11 +29,24 @@ struct ServerOptions {
     bool        multimodal     = false;
     bool        has_mtp        = false;
     bool        mtp            = false;
+    size_t      context_length = 0;  // 0 = auto-detect from ekv#### in filename
   };
   using EngineFactory =
       std::function<std::unique_ptr<EngineBase>(const LoadRequest& req,
                                                 std::string& error_out)>;
   EngineFactory build_engine;
+
+  // Set when --startup_load=none. Called once on the first inference request
+  // to lazily resolve, create, and warm up the engine. `model_hint` is the
+  // value of the "model" field from the request body (may be empty).
+  // Null means eager startup.
+  using LazyBuilder = std::function<std::unique_ptr<EngineBase>(
+      const std::string& model_hint, std::string& error_out)>;
+  LazyBuilder lazy_builder;
+
+  // Optional embedding engine for POST /v1/embeddings.
+  // Null means the endpoint returns 501.
+  EmbeddingEngine* embedding_engine = nullptr;
 };
 
 int RunServer(EngineManager& manager, const ServerOptions& options);

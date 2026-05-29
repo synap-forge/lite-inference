@@ -141,7 +141,7 @@ jobs:
               --port 8080 \
               --startup_load partial \
               --embed_repo litert-community/embeddinggemma-300m \
-              --embed_seq_len 1024
+              --embed_seq_len 512
 
             # ---- verify -----------------------------------------------------
             # Give the container a moment to settle before inspecting state.

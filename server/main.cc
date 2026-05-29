@@ -40,7 +40,7 @@ static void Usage(const char* prog) {
     "Embeddings (optional):\n"
     "  --embed_repo  REPO     HF repo for embedding .tflite (e.g. litert-community/embeddinggemma-300m)\n"
     "  --embed_file  FILE     Specific .tflite file within the repo (default: autodetect)\n"
-    "  --embed_seq_len N      Sequence length the embedding model was built for (default: 1024)\n"
+    "  --embed_seq_len N      Sequence length the embedding model was built for (default: 512)\n"
     "                         full:    load + warmup at startup (lowest first-request latency)\n"
     "                         partial: load at startup, skip warmup (first request pays GPU init)\n"
     "                         none:    defer everything to first request (fastest startup, slow first call)\n"
@@ -256,7 +256,7 @@ int main(int argc, char** argv) {
       return 2;
     }
 
-    int embed_seq_len = GetOptionalInt(argc, argv, "--embed_seq_len", 1024);
+    int embed_seq_len = GetOptionalInt(argc, argv, "--embed_seq_len", 512);
     fprintf(stderr, "Loading embedding model: %s\n", embed_path.c_str());
     embed_engine = lite_inference::EmbeddingEngine::Create(
         embed_path, embed_repo, embed_seq_len, engine->raw_engine(), embed_err);

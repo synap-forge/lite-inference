@@ -9,6 +9,11 @@ struct ResolveOptions {
   std::string repo_id     = "litert-community/gemma-4-E2B-it-litert-lm";
   std::string filename;     // empty = autodetect *.litertlm
   std::string revision    = "main";
+  // When autodetecting (filename empty), prefer the file whose seqNNNN tag
+  // matches this value. 0 = no preference. Used for embedding repos that ship
+  // multiple sequence-length builds (e.g. embeddinggemma seq256/512/1024/2048),
+  // where picking a length that doesn't match --embed_seq_len fails to compile.
+  int prefer_seq_len      = 0;
 };
 
 // Returns the absolute path to the model file, downloading if necessary.

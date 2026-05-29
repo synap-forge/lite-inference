@@ -60,6 +60,21 @@ LiteRtStatus LiteRtCreateOptions(LiteRtOptions* options);
 LITERT_C_MIN_EXPORT
 void LiteRtDestroyOptions(LiteRtOptions options);
 
+// Hardware accelerator bitmask (subset of the public LiteRtHwAcceleratorSet).
+// Default-constructed options request None (0), which makes CreateCompiledModel
+// fail to pick any backend for a standalone .tflite. Request CPU explicitly.
+typedef int LiteRtHwAccelerators;
+enum {
+  kLiteRtHwAcceleratorNone = 0,
+  kLiteRtHwAcceleratorCpu  = 1,
+  kLiteRtHwAcceleratorGpu  = 2,
+  kLiteRtHwAcceleratorNpu  = 4,
+};
+
+LITERT_C_MIN_EXPORT
+LiteRtStatus LiteRtSetOptionsHardwareAccelerators(
+    LiteRtOptions options, LiteRtHwAccelerators hardware_accelerators);
+
 // --------------------------------------------------------------------------
 // CompiledModel
 // --------------------------------------------------------------------------

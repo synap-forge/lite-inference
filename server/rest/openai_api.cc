@@ -279,6 +279,14 @@ void HandleChatCompletions(EngineManager& manager, const ServerOptions& opts,
   }
   EngineBase& engine = guard->engine();
 
+  // --startup_load partial defers warmup to here: run it once before the first
+  // real generation. The guard keeps this engine pinned across the warmup.
+  std::string warmup_err;
+  if (!manager.EnsureWarmed(engine, warmup_err)) {
+    JsonError(res, 503, "Engine warmup failed: " + warmup_err, "server_error");
+    return;
+  }
+
   if (body.contains("model") && body["model"].is_string()) {
     const std::string requested = body["model"].get<std::string>();
     if (requested != engine.model_id()) {

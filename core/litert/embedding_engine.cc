@@ -61,12 +61,30 @@ std::unique_ptr<EmbeddingEngine> EmbeddingEngine::Create(
     return nullptr;
   }
 
+  // Target CPU explicitly — the embedder is small and runs fine on CPU/XNNPACK
+  // regardless of the LLM backend. (Default options request no accelerator.)
+  st = LiteRtSetOptionsHardwareAccelerators(self->impl_->options,
+                                            kLiteRtHwAcceleratorCpu);
+  if (st != kLiteRtStatusOk) {
+    error_out = "LiteRtSetOptionsHardwareAccelerators failed (status=" +
+                std::to_string(st) + ")";
+    return nullptr;
+  }
+
   st = LiteRtCreateCompiledModel(self->impl_->model, nullptr,
                                  self->impl_->options,
                                  &self->impl_->compiled);
   if (st != kLiteRtStatusOk) {
+    // status=1 here means CreateCompiledModel rejected the null environment.
+    // The standalone embedding path needs a fully-initialized litert
+    // Environment (the LLM engine builds one internally via litert::lm::
+    // GetEnvironment, but the C API doesn't expose it for reuse). Until that's
+    // wired through, embedding init fails cleanly and the server still serves
+    // LLM traffic — it must not bring the process down.
     error_out = "LiteRtCreateCompiledModel failed (status=" +
-                std::to_string(st) + ")";
+                std::to_string(st) + "). Embedding model could not be compiled "
+                "(standalone embedder needs a litert Environment not yet wired "
+                "through the C API).";
     return nullptr;
   }
 

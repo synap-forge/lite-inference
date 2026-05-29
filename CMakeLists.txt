@@ -223,14 +223,17 @@ if(APPLE)
   # libLiteRtTopKWebGpuSampler.dylib, but the sampler dylib was built against
   # an older API and is missing 4 of 7 expected C entrypoints (notably
   # LiteRtTopKWebGpuSampler_UpdateConfig). When the WebGPU accelerator is
-  # loaded, the sampler factory tries WebGPU first, fails, then falls back to
-  # the CPU sampler, which then crashes trying to read GPU-resident logits
+  # loaded, the sampler factory tries WebGPU first, fails the dlsym, then falls
+  # back to the CPU sampler, which crashes trying to read GPU-resident logits
   # (top_p_cpu_sampler.cc -> litert_tensor_buffer ERROR). Symptom: warmup or
   # first inference fails with INTERNAL on Apple Silicon.
   #
-  # Excluding both dylibs forces the sampler factory down its Metal path,
-  # which works correctly with libLiteRtTopKMetalSampler.dylib. Re-enable
-  # once upstream ships a complete WebGPU sampler for macOS.
+  # Excluding both dylibs makes the engine pick up libLiteRtMetalAccelerator.dylib
+  # for GPU inference and libLiteRtTopKMetalSampler.dylib for sampling, which work
+  # correctly together. This exclusion only takes effect because make_portable.sh
+  # also strips the absolute LC_RPATH into the prebuilt source dir — without that,
+  # dyld finds the excluded WebGPU dylibs at their original location and the broken
+  # path comes back. Re-enable once upstream ships a complete WebGPU sampler.
   list(FILTER LITERT_PREBUILT_DYLIBS EXCLUDE REGEX "libLiteRt(TopK)?WebGpu[A-Za-z]*\\.dylib$")
   add_custom_command(TARGET litert_server POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different

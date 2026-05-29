@@ -18,7 +18,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-int ScoreFile(const std::string& name);  // defined below
+int ScoreFile(const std::string& name, int prefer_seq_len = 0);  // defined below
 
 std::string EnvOr(const char* name, const std::string& fallback) {
   const char* v = std::getenv(name);
@@ -49,19 +49,19 @@ std::string ReadRef(const fs::path& repo_dir, const std::string& revision) {
   return rev;
 }
 
-std::string FindModelFile(const fs::path& dir) {
+std::string FindModelFile(const fs::path& dir, int prefer_seq_len = 0) {
   std::error_code ec;
   std::string best;
   int best_score = -1;
   for (const auto& e : fs::directory_iterator(dir, ec)) {
-    int s = ScoreFile(e.path().filename().string());
+    int s = ScoreFile(e.path().filename().string(), prefer_seq_len);
     if (s > best_score) { best_score = s; best = e.path().string(); }
   }
   return best;
 }
 
 std::string FindCached(const fs::path& repo_dir, const std::string& revision,
-                       const std::string& filename) {
+                       const std::string& filename, int prefer_seq_len = 0) {
   std::error_code ec;
   std::vector<fs::path> candidates;
   std::string rev = ReadRef(repo_dir, revision);
@@ -75,7 +75,7 @@ std::string FindCached(const fs::path& repo_dir, const std::string& revision,
       fs::path f = snap / filename;
       if (fs::exists(f, ec)) return f.string();
     } else {
-      std::string found = FindModelFile(snap);
+      std::string found = FindModelFile(snap, prefer_seq_len);
       if (!found.empty()) return found;
     }
   }
@@ -138,9 +138,11 @@ std::vector<std::string> HfListFiles(const std::string& repo_id,
 //   - extension: .litertlm (10000) > .tflite (5000) > others (0)
 //   - quantization in name: q8 > q4 > f32/f16 (we prefer accuracy when small)
 //   - context size (ekv####): larger is better, up to a cap
+//   - seqNNNN match: when prefer_seq_len > 0, an exact match dominates and a
+//     mismatch is penalized (picking the wrong seq build fails to compile)
 //   - penalty for hardware-specific suffixes (mt6989, sm8550, Tensor_G5, etc.)
 //   - penalty for "_web" variants
-int ScoreFile(const std::string& name) {
+int ScoreFile(const std::string& name, int prefer_seq_len) {
   auto ends_with = [&](const char* s) {
     size_t n = std::strlen(s);
     return name.size() >= n &&
@@ -173,6 +175,19 @@ int ScoreFile(const std::string& name) {
     score += ekv / 64;                // ekv1280 -> 20, ekv4096 -> 64, ekv131072 -> 2048.
   }
 
+  // Sequence-length match (embedding builds: seq256/512/1024/2048). When the
+  // caller wants a specific length, an exact match must win decisively — the
+  // engine can only compile the build matching the seq_len it's configured for.
+  if (prefer_seq_len > 0) {
+    auto spos = name.find("seq");
+    int file_seq = 0;
+    if (spos != std::string::npos)
+      for (size_t i = spos + 3; i < name.size() && std::isdigit((unsigned char)name[i]); ++i)
+        file_seq = file_seq * 10 + (name[i] - '0');
+    if (file_seq == prefer_seq_len) score += 4000;       // exact match dominates
+    else if (file_seq > 0)         score -= 1000;        // wrong length: avoid
+  }
+
   // Hardware-specific builds: should only be picked if nothing else exists.
   // SoC tags we've seen in litert-community: mt6989/mt6991/mt6993 (MediaTek),
   // sm8550/sm8650/sm8750/sm8850 (Qualcomm Snapdragon), Tensor_G5 (Pixel).
@@ -192,14 +207,15 @@ int ScoreFile(const std::string& name) {
 
 // Picks the highest-scoring supported file from `files`. Returns "" if none
 // of the candidates are supported (.litertlm / .tflite).
-std::string PickBestFile(const std::vector<std::string>& files) {
+std::string PickBestFile(const std::vector<std::string>& files,
+                         int prefer_seq_len = 0) {
   std::string best;
   int best_score = -1;
   for (const auto& f : files) {
     // Skip files in subdirectories - the engine expects a single top-level
     // model file and the cache layout doesn't preserve subdir structure.
     if (f.find('/') != std::string::npos) continue;
-    int s = ScoreFile(f);
+    int s = ScoreFile(f, prefer_seq_len);
     if (s > best_score) { best_score = s; best = f; }
   }
   return best;
@@ -326,7 +342,8 @@ std::string ResolveModel(const ResolveOptions& options, std::string& error_out) 
   fs::path repo_dir = fs::path(HfHubDir()) / RepoFolder(options.repo_id);
 
   // 2. Check cache.
-  std::string cached = FindCached(repo_dir, options.revision, options.filename);
+  std::string cached = FindCached(repo_dir, options.revision, options.filename,
+                                  options.prefer_seq_len);
   if (!cached.empty()) {
     fprintf(stderr, "Using cached model: %s\n", cached.c_str());
     return cached;
@@ -342,7 +359,7 @@ std::string ResolveModel(const ResolveOptions& options, std::string& error_out) 
                   list_err;
       return {};
     }
-    filename = PickBestFile(files);
+    filename = PickBestFile(files, options.prefer_seq_len);
     if (filename.empty()) {
       error_out = "No supported model file (.litertlm or .tflite) in '" +
                   options.repo_id + "'. The repo only contains other formats "

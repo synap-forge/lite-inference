@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -28,8 +29,12 @@ class EngineManager {
   // initialized engine or nullptr on failure (with `error_out` set).
   using Builder = std::function<std::unique_ptr<EngineBase>(std::string& error_out)>;
 
-  explicit EngineManager(std::unique_ptr<EngineBase> initial)
-      : engine_(std::move(initial)) {}
+  // `initial_warmed` marks whether the initial engine has already been warmed
+  // up (e.g. --startup_load full warmed it at startup). When false, the first
+  // request triggers a one-time warmup via EnsureWarmed.
+  explicit EngineManager(std::unique_ptr<EngineBase> initial,
+                         bool initial_warmed = true)
+      : engine_(std::move(initial)), warmed_(initial_warmed) {}
 
   // Read-side guard: keeps a shared lock on the manager while the caller holds
   // it. The pointer is stable for the guard's lifetime.
@@ -56,11 +61,14 @@ class EngineManager {
   // Blocks until all outstanding Guards are released, then constructs the new
   // engine via `build`. If construction fails, the old engine is preserved
   // and the function returns false with `error_out` set.
+  // The builder is expected to warm up the engine before returning (the
+  // /v1/models/load factory does), so the swapped-in engine is marked warm.
   bool Swap(const Builder& build, std::string& error_out) {
     std::unique_lock<std::shared_mutex> lk(mtx_);
     auto next = build(error_out);
     if (!next) return false;
     engine_ = std::move(next);
+    warmed_.store(true, std::memory_order_relaxed);
     return true;
   }
 
@@ -75,12 +83,28 @@ class EngineManager {
     auto next = build(error_out);
     if (!next) return false;
     engine_ = std::move(next);
+    warmed_.store(false, std::memory_order_relaxed);
+    return true;
+  }
+
+  // Runs the engine's warmup exactly once, the first time it's called after a
+  // load/swap. Used for --startup_load partial, where warmup is deferred from
+  // startup to the first request. Subsequent calls are a cheap atomic check.
+  // The caller must hold a Guard so the engine can't be swapped mid-warmup.
+  bool EnsureWarmed(EngineBase& engine, std::string& error_out) {
+    if (warmed_.load(std::memory_order_acquire)) return true;
+    std::lock_guard<std::mutex> lk(warmup_mtx_);
+    if (warmed_.load(std::memory_order_relaxed)) return true;
+    if (!engine.Warmup(error_out)) return false;
+    warmed_.store(true, std::memory_order_release);
     return true;
   }
 
  private:
   std::shared_mutex            mtx_;
   std::unique_ptr<EngineBase>  engine_;
+  std::mutex                   warmup_mtx_;
+  std::atomic<bool>            warmed_{false};
 };
 
 }  // namespace lite_inference

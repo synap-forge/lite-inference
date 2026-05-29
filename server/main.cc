@@ -147,7 +147,15 @@ int main(int argc, char** argv) {
     fprintf(stderr, "Startup load deferred — model will load on first request\n");
   }
 
-  lite_inference::EngineManager manager(std::move(engine));
+  // The embedding engine borrows the LLM engine's tokenizer. Capture the raw
+  // handle before `engine` is moved into the manager below — dereferencing the
+  // moved-from unique_ptr later is a null deref (segfault).
+  LiteRtLmEngine* tokenizer_engine = engine ? engine->raw_engine() : nullptr;
+
+  // full: engine was warmed above. partial: warmup deferred to first request.
+  // none: engine is null; the lazy builder warms it on first request.
+  lite_inference::EngineManager manager(std::move(engine),
+                                        /*initial_warmed=*/startup_load == "full");
 
   lite_inference::ServerOptions opts;
   opts.host    = GetArg(argc, argv, "--host",    "0.0.0.0");
@@ -244,10 +252,13 @@ int main(int argc, char** argv) {
                       "(cannot use with --startup_load=none alone).\n");
       return 1;
     }
+    int embed_seq_len = GetOptionalInt(argc, argv, "--embed_seq_len", 512);
+
     lite_inference::ResolveOptions embed_resolve;
-    embed_resolve.repo_id  = embed_repo;
-    embed_resolve.filename = GetArg(argc, argv, "--embed_file");
-    embed_resolve.revision = GetArg(argc, argv, "--hf_revision", "main");
+    embed_resolve.repo_id        = embed_repo;
+    embed_resolve.filename       = GetArg(argc, argv, "--embed_file");
+    embed_resolve.revision       = GetArg(argc, argv, "--hf_revision", "main");
+    embed_resolve.prefer_seq_len = embed_seq_len;
 
     std::string embed_err;
     std::string embed_path = lite_inference::ResolveModel(embed_resolve, embed_err);
@@ -256,15 +267,19 @@ int main(int argc, char** argv) {
       return 2;
     }
 
-    int embed_seq_len = GetOptionalInt(argc, argv, "--embed_seq_len", 512);
     fprintf(stderr, "Loading embedding model: %s\n", embed_path.c_str());
     embed_engine = lite_inference::EmbeddingEngine::Create(
-        embed_path, embed_repo, embed_seq_len, engine->raw_engine(), embed_err);
+        embed_path, embed_repo, embed_seq_len, tokenizer_engine, embed_err);
     if (!embed_engine) {
-      fprintf(stderr, "Embedding engine init failed: %s\n", embed_err.c_str());
-      return 1;
+      // Non-fatal: the LLM engine is already up and the server can serve chat
+      // traffic. Embeddings are an optional add-on, so log and continue rather
+      // than refusing to start. /v1/embeddings will report "not available".
+      fprintf(stderr, "Warning: embedding engine init failed: %s\n"
+                      "Continuing without embeddings; /v1/embeddings disabled.\n",
+              embed_err.c_str());
+    } else {
+      opts.embedding_engine = embed_engine.get();
     }
-    opts.embedding_engine = embed_engine.get();
   }
 
   return lite_inference::RunServer(manager, opts);

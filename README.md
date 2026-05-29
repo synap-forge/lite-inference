@@ -298,3 +298,10 @@ python3 benchmark.py \
   --image /Volumes/Sources/Documents/Projects/receipts/costco.jpg \
   --prompt "What is in this image?" \
   -n 10 -c 10 2>&1
+
+
+cmake -S . -B build 2>&1 | tail -10 && cmake --build build --target litert_server -j 2>&1 | tail -40
+
+cmake -B build 2>&1 | tail -3 && cmake --build build -j8 2>&1 | tail -10
+
+cmake -B build -GNinja 2>&1 | tail -5 && cmake --build build -j8 2>&1 | tail -10

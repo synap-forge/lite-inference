@@ -1,0 +1,3 @@
+{
+  "bazel.projectRootSearchPaths": ["LiteRT-LM"]
+}

@@ -1,3 +1,4 @@
 [submodule "LiteRT-LM"]
 	path = LiteRT-LM
-	url = https://github.com/google-ai-edge/LiteRT-LM.git
+	url = git@github.com:aminnasiri/LiteRT-LM.git
+	branch = lite-inference-embeddings

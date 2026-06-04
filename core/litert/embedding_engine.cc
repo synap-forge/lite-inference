@@ -1,32 +1,21 @@
 #include "core/litert/embedding_engine.h"
 
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "c/engine.h"
-#include "core/litert/litert_c_api_min.h"
 
 namespace lite_inference {
 
 struct EmbeddingEngine::Impl {
-  LiteRtModel         model    = nullptr;
-  LiteRtCompiledModel compiled = nullptr;
-  LiteRtOptions       options  = nullptr;
-  LiteRtLmEngine*     tokenizer = nullptr;
-  int seq_len = 0;
-  int dim     = 0;
+  LiteRtLmEmbedder* embedder = nullptr;
 };
 
 EmbeddingEngine::~EmbeddingEngine() {
-  if (!impl_) return;
-  if (impl_->compiled) LiteRtDestroyCompiledModel(impl_->compiled);
-  if (impl_->options)  LiteRtDestroyOptions(impl_->options);
-  if (impl_->model)    LiteRtDestroyModel(impl_->model);
+  if (impl_ && impl_->embedder) {
+    litert_lm_embedder_delete(impl_->embedder);
+  }
 }
 
 std::unique_ptr<EmbeddingEngine> EmbeddingEngine::Create(
@@ -40,174 +29,44 @@ std::unique_ptr<EmbeddingEngine> EmbeddingEngine::Create(
     return nullptr;
   }
 
+  // The embedder is compiled inside the engine .so, where the litert C++
+  // Environment is available and reused. This is the only place a standalone
+  // .tflite can be compiled against a non-null environment.
+  LiteRtLmEmbedder* embedder =
+      litert_lm_engine_create_embedder(tokenizer, model_path.c_str(), seq_len);
+  if (!embedder) {
+    error_out = "litert_lm_engine_create_embedder failed for: " + model_path +
+                " (see engine logs for details)";
+    return nullptr;
+  }
+
   auto self = std::unique_ptr<EmbeddingEngine>(new EmbeddingEngine());
   self->impl_ = std::make_unique<Impl>();
-  self->impl_->tokenizer = tokenizer;
-  self->impl_->seq_len   = seq_len;
-  self->model_id_        = model_id;
-  self->seq_len_         = seq_len;
-
-  LiteRtStatus st = LiteRtCreateModelFromFile(model_path.c_str(),
-                                              &self->impl_->model);
-  if (st != kLiteRtStatusOk) {
-    error_out = "LiteRtCreateModelFromFile failed (status=" +
-                std::to_string(st) + ") for: " + model_path;
-    return nullptr;
-  }
-
-  st = LiteRtCreateOptions(&self->impl_->options);
-  if (st != kLiteRtStatusOk) {
-    error_out = "LiteRtCreateOptions failed (status=" + std::to_string(st) + ")";
-    return nullptr;
-  }
-
-  // Target CPU explicitly — the embedder is small and runs fine on CPU/XNNPACK
-  // regardless of the LLM backend. (Default options request no accelerator.)
-  st = LiteRtSetOptionsHardwareAccelerators(self->impl_->options,
-                                            kLiteRtHwAcceleratorCpu);
-  if (st != kLiteRtStatusOk) {
-    error_out = "LiteRtSetOptionsHardwareAccelerators failed (status=" +
-                std::to_string(st) + ")";
-    return nullptr;
-  }
-
-  st = LiteRtCreateCompiledModel(self->impl_->model, nullptr,
-                                 self->impl_->options,
-                                 &self->impl_->compiled);
-  if (st != kLiteRtStatusOk) {
-    // status=1 here means CreateCompiledModel rejected the null environment.
-    // The standalone embedding path needs a fully-initialized litert
-    // Environment (the LLM engine builds one internally via litert::lm::
-    // GetEnvironment, but the C API doesn't expose it for reuse). Until that's
-    // wired through, embedding init fails cleanly and the server still serves
-    // LLM traffic — it must not bring the process down.
-    error_out = "LiteRtCreateCompiledModel failed (status=" +
-                std::to_string(st) + "). Embedding model could not be compiled "
-                "(standalone embedder needs a litert Environment not yet wired "
-                "through the C API).";
-    return nullptr;
-  }
-
-  // Probe the output buffer size to determine the embedding dimension.
-  // Output shape is [1, dim] float32 → size = dim * 4.
-  const LiteRtTensorBufferRequirements* out_req = nullptr;
-  st = LiteRtGetCompiledModelOutputBufferRequirements(
-      self->impl_->compiled, 0, 0, &out_req);
-  if (st != kLiteRtStatusOk || !out_req) {
-    error_out = "Failed to get output buffer requirements";
-    return nullptr;
-  }
-  size_t out_bytes = 0;
-  LiteRtGetTensorBufferRequirementsBufferSize(out_req, &out_bytes);
-  self->impl_->dim = static_cast<int>(out_bytes / sizeof(float));
-  self->dim_       = self->impl_->dim;
-
-  fprintf(stderr, "[EmbeddingEngine] Loaded %s  seq=%d  dim=%d\n",
-          model_id.c_str(), seq_len, self->dim_);
+  self->impl_->embedder = embedder;
+  self->model_id_ = model_id;
+  self->seq_len_  = seq_len;
+  self->dim_      = litert_lm_embedder_get_dim(embedder);
   return self;
 }
 
 std::vector<float> EmbeddingEngine::Embed(const std::string& text,
                                           std::string& error_out) {
-  // ---------- Tokenize via borrowed LLM engine tokenizer ----------
-  LiteRtLmTokenizeResult* tok =
-      litert_lm_engine_tokenize(impl_->tokenizer, text.c_str());
-  if (!tok) {
-    error_out = "Tokenization failed";
-    return {};
-  }
-  size_t num_tokens = litert_lm_tokenize_result_get_num_tokens(tok);
-  const int* token_ids = litert_lm_tokenize_result_get_tokens(tok);
-
-  // Build int32 input padded/truncated to seq_len.
-  std::vector<int32_t> input(impl_->seq_len, 0);
-  size_t copy_n = std::min(num_tokens, static_cast<size_t>(impl_->seq_len));
-  for (size_t i = 0; i < copy_n; ++i)
-    input[i] = static_cast<int32_t>(token_ids[i]);
-  litert_lm_tokenize_result_delete(tok);
-
-  // ---------- Allocate input buffer ----------
-  const LiteRtTensorBufferRequirements* in_req = nullptr;
-  LiteRtStatus st = LiteRtGetCompiledModelInputBufferRequirements(
-      impl_->compiled, 0, 0, &in_req);
-  if (st != kLiteRtStatusOk || !in_req) {
-    error_out = "Failed to get input buffer requirements";
+  if (!impl_ || !impl_->embedder) {
+    error_out = "Embedding engine not initialized";
     return {};
   }
 
-  LiteRtTensorBuffer in_buf = nullptr;
-  st = LiteRtCreateManagedTensorBuffer(kLiteRtTensorBufferTypeHostMemory,
-                                       in_req, &in_buf);
-  if (st != kLiteRtStatusOk || !in_buf) {
-    error_out = "Failed to create input tensor buffer";
+  LiteRtLmEmbedResult* result =
+      litert_lm_embedder_embed(impl_->embedder, text.c_str());
+  if (!result) {
+    error_out = "litert_lm_embedder_embed failed (see engine logs for details)";
     return {};
   }
 
-  // ---------- Allocate output buffer ----------
-  const LiteRtTensorBufferRequirements* out_req = nullptr;
-  st = LiteRtGetCompiledModelOutputBufferRequirements(
-      impl_->compiled, 0, 0, &out_req);
-  if (st != kLiteRtStatusOk || !out_req) {
-    LiteRtDestroyTensorBuffer(in_buf);
-    error_out = "Failed to get output buffer requirements";
-    return {};
-  }
-
-  LiteRtTensorBuffer out_buf = nullptr;
-  st = LiteRtCreateManagedTensorBuffer(kLiteRtTensorBufferTypeHostMemory,
-                                       out_req, &out_buf);
-  if (st != kLiteRtStatusOk || !out_buf) {
-    LiteRtDestroyTensorBuffer(in_buf);
-    error_out = "Failed to create output tensor buffer";
-    return {};
-  }
-
-  // ---------- Write tokens into input buffer ----------
-  void* in_ptr = nullptr;
-  st = LiteRtLockTensorBuffer(in_buf, &in_ptr, nullptr);
-  if (st != kLiteRtStatusOk || !in_ptr) {
-    LiteRtDestroyTensorBuffer(in_buf);
-    LiteRtDestroyTensorBuffer(out_buf);
-    error_out = "Failed to lock input tensor buffer";
-    return {};
-  }
-  std::memcpy(in_ptr, input.data(), input.size() * sizeof(int32_t));
-  LiteRtUnlockTensorBuffer(in_buf);
-
-  // ---------- Run ----------
-  st = LiteRtRunCompiledModel(impl_->compiled, 0, 1, &in_buf, 1, &out_buf);
-  if (st != kLiteRtStatusOk) {
-    LiteRtDestroyTensorBuffer(in_buf);
-    LiteRtDestroyTensorBuffer(out_buf);
-    error_out = "LiteRtRunCompiledModel failed (status=" +
-                std::to_string(st) + ")";
-    return {};
-  }
-
-  // ---------- Read output ----------
-  void* out_ptr = nullptr;
-  st = LiteRtLockTensorBuffer(out_buf, &out_ptr, nullptr);
-  if (st != kLiteRtStatusOk || !out_ptr) {
-    LiteRtDestroyTensorBuffer(in_buf);
-    LiteRtDestroyTensorBuffer(out_buf);
-    error_out = "Failed to lock output tensor buffer";
-    return {};
-  }
-
-  std::vector<float> embedding(impl_->dim);
-  std::memcpy(embedding.data(), out_ptr, impl_->dim * sizeof(float));
-  LiteRtUnlockTensorBuffer(out_buf);
-
-  LiteRtDestroyTensorBuffer(in_buf);
-  LiteRtDestroyTensorBuffer(out_buf);
-
-  // ---------- L2 normalize ----------
-  float norm = 0.0f;
-  for (float v : embedding) norm += v * v;
-  norm = std::sqrt(norm);
-  if (norm > 1e-9f)
-    for (float& v : embedding) v /= norm;
-
+  const float* values = litert_lm_embed_result_get_values(result);
+  size_t n = litert_lm_embed_result_get_num_floats(result);
+  std::vector<float> embedding(values, values + n);
+  litert_lm_embed_result_delete(result);
   return embedding;
 }
 

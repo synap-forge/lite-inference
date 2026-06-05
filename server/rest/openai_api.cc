@@ -5,6 +5,7 @@
 #define LITERT_VERSION "dev"
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -24,6 +25,13 @@
 #include "hub/model_resolver.h"
 #include "server/rest/openapi.h"
 #include "server/rest/reflect.h"
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+#define STB_IMAGE_RESIZE_IMPLEMENTATION
+#include "stb_image_resize2.h"
 
 namespace {
 
@@ -78,6 +86,56 @@ std::string LocalPath(const std::string& url) {
   if (url.substr(0, 7) == "file://") return url.substr(7);
   if (!url.empty() && (url[0] == '/' || url[0] == '.')) return url;
   return {};
+}
+
+// Bound the long side of very large images before handing them to the engine.
+// Gemma's vision encoder runs its own Pan & Scan and handles arbitrary aspect
+// ratios internally, so we do NOT pad or change aspect here — letterboxing a
+// tall receipt onto a black canvas only shrinks its effective resolution and
+// inflates the visual-token count (garbled output + slow prefill). We only
+// downscale when an image is larger than the encoder needs, preserving aspect.
+// Returns re-encoded PNG bytes, or empty if the input is unchanged/undecodable
+// (callers fall back to the original bytes/path in that case).
+constexpr int kMaxImageDim = 896;  // longest side after normalization
+
+std::vector<uint8_t> NormalizeImageBytes(const std::vector<uint8_t>& in) {
+  if (in.empty()) return {};
+  int w = 0, h = 0, ch = 0;
+  unsigned char* px =
+      stbi_load_from_memory(in.data(), static_cast<int>(in.size()), &w, &h, &ch, 3);
+  if (!px || w <= 0 || h <= 0) {
+    if (px) stbi_image_free(px);
+    return {};  // not a decodable raster image — let the engine try the raw bytes
+  }
+
+  const int long_side = std::max(w, h);
+  if (long_side <= kMaxImageDim) {
+    stbi_image_free(px);
+    return {};  // already within safe bounds — keep the original encoding
+  }
+
+  // Scale so the long side fits kMaxImageDim, preserving aspect ratio.
+  const float scale = static_cast<float>(kMaxImageDim) / long_side;
+  const int sw = std::max(1, static_cast<int>(w * scale));
+  const int sh = std::max(1, static_cast<int>(h * scale));
+
+  std::vector<unsigned char> scaled(static_cast<size_t>(sw) * sh * 3);
+  if (!stbir_resize_uint8_srgb(px, w, h, 0, scaled.data(), sw, sh, 0,
+                               STBIR_RGB)) {
+    stbi_image_free(px);
+    return {};
+  }
+  stbi_image_free(px);
+
+  std::vector<uint8_t> out;
+  auto sink = [](void* ctx, void* data, int len) {
+    auto* v = static_cast<std::vector<uint8_t>*>(ctx);
+    v->insert(v->end(), static_cast<uint8_t*>(data),
+              static_cast<uint8_t*>(data) + len);
+  };
+  if (!stbi_write_png_to_func(sink, &out, sw, sh, 3, scaled.data(), sw * 3))
+    return {};
+  return out;
 }
 
 // Resolve any URL/path/data-URI to raw bytes.
@@ -151,13 +209,14 @@ bool ParseChat(const json& body, ParsedRequest& out, std::string& err) {
             cm.content += p.value("text", "");
           } else if (type == "image_url" && p.contains("image_url")) {
             std::string url = p["image_url"].value("url", "");
-            std::string lp = LocalPath(url);
-            if (!lp.empty()) {
-              cm.media.push_back({MediaType::kImage, lp, {}});
-            } else {
-              auto bytes = DecodeDataUrl(url);
-              if (!bytes.empty())
-                cm.media.push_back({MediaType::kImage, {}, std::move(bytes)});
+            // Resolve to raw bytes (even for local paths) so we can normalize
+            // extreme aspect ratios before the engine's vision encoder, which
+            // crashes on degenerate patch grids.
+            auto bytes = DecodeDataUrl(url);
+            if (!bytes.empty()) {
+              auto norm = NormalizeImageBytes(bytes);
+              if (!norm.empty()) bytes = std::move(norm);
+              cm.media.push_back({MediaType::kImage, {}, std::move(bytes)});
             }
           } else if (type == "input_audio" && p.contains("input_audio")) {
             const auto& ia = p["input_audio"];
@@ -305,6 +364,22 @@ void HandleChatCompletions(EngineManager& manager, const ServerOptions& opts,
   if (!ParseChat(body, pr, parse_err)) {
     JsonError(res, 400, parse_err, "invalid_request_error");
     return;
+  }
+
+  // Reject image/audio input when the engine has no vision/audio backend.
+  // Forwarding media to a non-multimodal engine (started without --multimodal,
+  // so max_num_images=0) segfaults inside the conversation processor.
+  if (!engine.multimodal()) {
+    for (const auto& m : pr.messages) {
+      if (!m.media.empty()) {
+        JsonError(res, 400,
+                  "This model is loaded without multimodal support, so image "
+                  "and audio inputs are not accepted. Restart the server with "
+                  "--multimodal (or load the model with {\"multimodal\": true}).",
+                  "invalid_request_error");
+        return;
+      }
+    }
   }
 
   const std::string id      = NewId("chatcmpl");

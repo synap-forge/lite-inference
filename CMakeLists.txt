@@ -164,10 +164,22 @@ FetchContent_Declare(nlohmann_json
   CMAKE_ARGS -DJSON_BuildTests=OFF
   DOWNLOAD_EXTRACT_TIMESTAMP FALSE
 )
+# stb single-header image decode/resize/encode — used to normalize extreme
+# aspect-ratio images before handing them to the vision encoder (which
+# segfaults on degenerate patch grids). Header-only; no build target.
+FetchContent_Declare(stb
+  GIT_REPOSITORY https://github.com/nothings/stb.git
+  GIT_TAG f0569113c93ad095470c54bf34a17b36646bbbb5
+  GIT_SHALLOW FALSE
+)
 
 set(HTTPLIB_COMPILE OFF CACHE BOOL "" FORCE)   # keep header-only
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(cpp_httplib nlohmann_json)
+FetchContent_GetProperties(stb)
+if(NOT stb_POPULATED)
+  FetchContent_Populate(stb)
+endif()
 
 # ---------------------------------------------------------------------------
 # Server binary
@@ -185,6 +197,7 @@ add_executable(litert_server
 target_include_directories(litert_server PRIVATE
   "${CMAKE_SOURCE_DIR}"
   "${cpp_httplib_SOURCE_DIR}"
+  "${stb_SOURCE_DIR}"
 )
 
 # OpenSSL for HTTPS in model_resolver (system OpenSSL, available on macOS via Homebrew).

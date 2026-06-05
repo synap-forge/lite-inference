@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -82,6 +83,7 @@ static int GetOptionalInt(int argc, char** argv, const char* flag, int fallback)
 }
 
 int main(int argc, char** argv) {
+  const auto startup_begin = std::chrono::steady_clock::now();
   for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
       Usage(argv[0]); return 0;
@@ -281,6 +283,13 @@ int main(int argc, char** argv) {
       opts.embedding_engine = embed_engine.get();
     }
   }
+
+  const double startup_secs =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                    startup_begin)
+          .count();
+  fprintf(stderr, "Startup complete in %.2fs — listening on port %d\n",
+          startup_secs, opts.port);
 
   return lite_inference::RunServer(manager, opts);
 }

@@ -1,4 +1,4 @@
 [submodule "LiteRT-LM"]
 	path = LiteRT-LM
-	url = git@github.com:aminnasiri/LiteRT-LM.git
-	branch = lite-inference-embeddings
+	url = git@github.com:synap-forge/LiteRT-LM.git
+	branch = main
